@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ChatOptions` and `IntegrationFlags` in `models::options` — user-facing
+  per-call chat overrides, exported from the crate root.
+- `PollStatus` enum replacing the stringly-typed `PollOutput.status` field.
+
+### Changed
+- BREAKING (library API, not wire): `Conversations::start(message)` now takes
+  the initial message as a positional argument, so new-conversation requests
+  require it at compile time.
+- BREAKING (library API): `Conversations::continue_` and `Conversations::get`
+  now accept `impl Into<ConversationId>`, so `&str`, `String`, and
+  `ConversationId` all work directly.
+- `StartConversation` and `ContinueConversation` now share the single
+  `ChatOptions` struct instead of duplicating the per-call mode, attachment,
+  and integration-flag fields.
+- `PollOutput.status` now uses the `PollStatus` enum while preserving the JSON
+  wire values (`"in_progress"`, `"completed"`, `"not_found"`).
+
+### Removed
+- `apply_research_options!` and the private conversation-builder override
+  helpers, now replaced by `ChatOptions` conversions.
+
 ## [0.1.0] — 2026-04-18
 
 ### Added

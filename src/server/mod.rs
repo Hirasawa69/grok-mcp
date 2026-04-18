@@ -29,6 +29,7 @@ use crate::{
     config::RuntimeState,
     error::Error,
     models::{
+        ChatOptions, IntegrationFlags,
         chat::{FinalChatResult, LoadedResponse},
         common::{
             AgentMessage, ConversationId, FollowUpSuggestion, Mode, ResponseId, ResponseStep,
@@ -39,7 +40,7 @@ use crate::{
     server::{
         output::{
             AuthStatus, DefaultsOutput, GetConversationOutput, ListConversationsOutput, PollOutput,
-            RateLimitsOutput, ResearchStartOutput, StepThinking, UploadFileOutput,
+            PollStatus, RateLimitsOutput, ResearchStartOutput, StepThinking, UploadFileOutput,
         },
         params::{
             AskParams, GetConversationParams, ListConversationsParams, PollParams,
@@ -48,20 +49,6 @@ use crate::{
         progress::{ProgressForwarder, extract_progress_token},
     },
 };
-
-macro_rules! apply_research_options {
-    ($builder:expr, $params:expr) => {
-        $builder
-            .maybe_disable_search($params.disable_search)
-            .maybe_force_concise($params.force_concise)
-            .maybe_disable_memory($params.disable_memory)
-            .maybe_enable_gmail_search($params.enable_gmail_search)
-            .maybe_enable_google_calendar_search($params.enable_google_calendar_search)
-            .maybe_enable_outlook_search($params.enable_outlook_search)
-            .maybe_enable_outlook_calendar_search($params.enable_outlook_calendar_search)
-            .maybe_enable_google_drive_search($params.enable_google_drive_search)
-    };
-}
 
 /// MCP server that bridges an in-process agent to grok.com.
 ///
@@ -200,7 +187,7 @@ impl Server {
         let output = self
             .client
             .conversations()
-            .get(params.conversation_id.as_str())
+            .get(params.conversation_id.clone())
             .maybe_include_messages(Some(params.include_messages))
             .send()
             .await
@@ -323,7 +310,7 @@ impl Server {
             .find(|response| response.response_id == response_id)
         else {
             return Ok(Json(PollOutput {
-                status: "not_found".to_owned(),
+                status: PollStatus::NotFound,
                 result: None,
                 thinking_steps: None,
             }));
@@ -331,7 +318,7 @@ impl Server {
 
         if response_is_partial(&loaded_response) {
             return Ok(Json(PollOutput {
-                status: "in_progress".to_owned(),
+                status: PollStatus::InProgress,
                 result: None,
                 thinking_steps: None,
             }));
@@ -352,7 +339,7 @@ impl Server {
         }
 
         Ok(Json(PollOutput {
-            status: "completed".to_owned(),
+            status: PollStatus::Completed,
             result: Some(Box::new(result)),
             thinking_steps,
         }))
@@ -449,32 +436,30 @@ impl Server {
         params: &AskParams,
         effective_mode: Mode,
     ) -> crate::error::Result<(crate::client::stream::StreamHandle, Option<ConversationId>)> {
+        let mut options = chat_options_from_params(params);
+        options.mode = Some(effective_mode);
+
         match params.conversation_id.clone() {
-            Some(conv_id) => {
-                let builder = apply_research_options!(
-                    self.client
-                        .conversations()
-                        .continue_(conv_id.as_str())
-                        .message(params.message.clone())
-                        .mode(effective_mode)
-                        .attachments(params.attachments.clone())
-                        .maybe_parent_response_id(params.parent_response_id.clone()),
-                    params
-                );
-                let handle = builder.send().await?;
-                Ok((handle, Some(conv_id)))
+            Some(conversation_id) => {
+                let handle = self
+                    .client
+                    .conversations()
+                    .continue_(conversation_id.clone())
+                    .message(params.message.clone())
+                    .maybe_parent_response_id(params.parent_response_id.clone())
+                    .options(options)
+                    .send()
+                    .await?;
+                Ok((handle, Some(conversation_id)))
             }
             None => {
-                let builder = apply_research_options!(
-                    self.client
-                        .conversations()
-                        .start()
-                        .message(params.message.clone())
-                        .mode(effective_mode)
-                        .attachments(params.attachments.clone()),
-                    params
-                );
-                let handle = builder.send().await?;
+                let handle = self
+                    .client
+                    .conversations()
+                    .start(params.message.clone())
+                    .options(options)
+                    .send()
+                    .await?;
                 Ok((handle, None))
             }
         }
@@ -686,6 +671,23 @@ fn guess_mime_from_name(name: &str) -> Option<String> {
     Some(mime.to_owned())
 }
 
+fn chat_options_from_params(params: &AskParams) -> ChatOptions {
+    ChatOptions {
+        mode: params.mode.clone(),
+        attachments: params.attachments.clone(),
+        disable_search: params.disable_search,
+        force_concise: params.force_concise,
+        disable_memory: params.disable_memory,
+        integrations: IntegrationFlags {
+            gmail: params.enable_gmail_search,
+            google_calendar: params.enable_google_calendar_search,
+            outlook: params.enable_outlook_search,
+            outlook_calendar: params.enable_outlook_calendar_search,
+            google_drive: params.enable_google_drive_search,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -698,7 +700,7 @@ mod tests {
         models::{
             ConversationId, FinalChatResult, LoadedResponse, ResponseStep, RolloutId, ToolUsageCard,
         },
-        server::output::StepThinking,
+        server::output::{PollStatus, StepThinking},
     };
 
     #[test]
@@ -797,7 +799,7 @@ mod tests {
     #[test]
     fn poll_output_serializes_with_expected_status_shapes() {
         let in_progress = serde_json::to_value(PollOutput {
-            status: "in_progress".to_owned(),
+            status: PollStatus::InProgress,
             result: None,
             thinking_steps: None,
         })
@@ -809,7 +811,7 @@ mod tests {
         assert_eq!(in_progress.get("result"), None);
 
         let completed = serde_json::to_value(PollOutput {
-            status: "completed".to_owned(),
+            status: PollStatus::Completed,
             result: Some(Box::new(FinalChatResult {
                 conversation_id: ConversationId::new("c1"),
                 response_id: crate::models::ResponseId::new("r1"),

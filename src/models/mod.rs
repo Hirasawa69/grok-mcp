@@ -14,6 +14,7 @@
 pub mod api_error;
 pub mod chat;
 pub mod common;
+pub mod options;
 pub mod rate_limits;
 pub mod skills;
 pub mod subscriptions;
@@ -30,6 +31,7 @@ pub use common::{
     RolloutId, Sender, ToolOverrides, ToolUsageCard, ToolUsageCardId, UserId, UserResponse,
     WebSearchResult,
 };
+pub use options::{ChatOptions, IntegrationFlags};
 pub use rate_limits::{RateLimitTier, RateLimits};
 pub use skills::{Skill, SkillsResponse};
 pub use subscriptions::{Subscription, SubscriptionStatus, SubscriptionsResponse, Tier};

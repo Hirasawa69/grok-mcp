@@ -6,12 +6,10 @@ use serde_json::json;
 
 use crate::{
     client::{GrokClient, stream::StreamHandle},
-    config::ChatDefaults,
-    error::{ConfigError, Error, Result},
+    error::{Error, Result},
     models::{
-        ChatRequestOptions, ContinueConversationRequest, Conversation, ConversationId,
-        FileMetadataId, LoadResponsesResponse, LoadedResponse, Mode, NewConversationRequest,
-        ResponseId, ResponseNode, ToolOverrides,
+        ChatOptions, Conversation, ConversationId, LoadResponsesResponse, LoadedResponse,
+        ResponseId, ResponseNode,
     },
     server::output::GetConversationOutput,
 };
@@ -44,28 +42,21 @@ struct ConversationEnvelope {
 #[derive(Clone, Copy)]
 pub struct Conversations<'a>(&'a GrokClient);
 
-/// Data assembled by the generated `StartConversationBuilder`.
+/// Fresh-conversation request builder.
 #[derive(Builder)]
+#[builder(finish_fn = send_request)]
 pub struct StartConversation<'a> {
     #[builder(start_fn)]
     client: &'a GrokClient,
-    #[builder(into)]
-    message: Option<String>,
-    mode: Option<Mode>,
+    #[builder(start_fn, into)]
+    message: String,
     #[builder(default)]
-    attachments: Vec<FileMetadataId>,
-    disable_search: Option<bool>,
-    force_concise: Option<bool>,
-    disable_memory: Option<bool>,
-    enable_gmail_search: Option<bool>,
-    enable_google_calendar_search: Option<bool>,
-    enable_outlook_search: Option<bool>,
-    enable_outlook_calendar_search: Option<bool>,
-    enable_google_drive_search: Option<bool>,
+    options: ChatOptions,
 }
 
-/// Data assembled by the generated `ContinueConversationBuilder`.
+/// Continuation-of-conversation request builder.
 #[derive(Builder)]
+#[builder(finish_fn = send_request)]
 pub struct ContinueConversation<'a> {
     #[builder(start_fn)]
     client: &'a GrokClient,
@@ -74,17 +65,8 @@ pub struct ContinueConversation<'a> {
     #[builder(into)]
     message: Option<String>,
     parent_response_id: Option<ResponseId>,
-    mode: Option<Mode>,
     #[builder(default)]
-    attachments: Vec<FileMetadataId>,
-    disable_search: Option<bool>,
-    force_concise: Option<bool>,
-    disable_memory: Option<bool>,
-    enable_gmail_search: Option<bool>,
-    enable_google_calendar_search: Option<bool>,
-    enable_outlook_search: Option<bool>,
-    enable_outlook_calendar_search: Option<bool>,
-    enable_google_drive_search: Option<bool>,
+    options: ChatOptions,
 }
 
 /// Data assembled by the generated `ListConversationsBuilder`.
@@ -109,20 +91,27 @@ pub struct GetConversation<'a> {
 }
 
 impl<'a> Conversations<'a> {
-    pub fn start(self) -> StartConversationBuilder<'a> {
-        StartConversation::builder(self.0)
+    /// Begin a new conversation with an initial user message.
+    pub fn start(self, message: impl Into<String>) -> StartConversationBuilder<'a> {
+        StartConversation::builder(self.0, message.into())
     }
 
-    pub fn continue_(self, id: &str) -> ContinueConversationBuilder<'a> {
-        ContinueConversation::builder(self.0, ConversationId::new(id))
+    /// Continue an existing conversation by id.
+    pub fn continue_(
+        self,
+        conversation_id: impl Into<ConversationId>,
+    ) -> ContinueConversationBuilder<'a> {
+        ContinueConversation::builder(self.0, conversation_id.into())
     }
 
+    /// Build a paginated conversation-list request.
     pub fn list(self) -> ListConversationsBuilder<'a> {
         ListConversations::builder(self.0)
     }
 
-    pub fn get(self, id: &str) -> GetConversationBuilder<'a> {
-        GetConversation::builder(self.0, ConversationId::new(id))
+    /// Build a conversation fetch request by id.
+    pub fn get(self, conversation_id: impl Into<ConversationId>) -> GetConversationBuilder<'a> {
+        GetConversation::builder(self.0, conversation_id.into())
     }
 
     pub async fn response_node(
@@ -150,28 +139,23 @@ impl<'a> Conversations<'a> {
 
 impl<'a, S> StartConversationBuilder<'a, S>
 where
-    S: start_conversation_builder::State,
+    S: start_conversation_builder::IsComplete,
 {
+    /// Submit the request and return a live stream handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or if the streaming response
+    /// cannot be decoded.
     pub async fn send(self) -> Result<StreamHandle> {
-        self.build().send().await
-    }
-}
-
-impl<'a> StartConversation<'a> {
-    async fn send(self) -> Result<StreamHandle> {
-        let overrides = self.overrides();
-        let message = self
-            .message
-            .ok_or_else(|| Error::Config(ConfigError::MissingRequired("message")))?;
-        let defaults = self.client.runtime().defaults().await;
-        let body = build_new_conversation_request(
+        let StartConversation {
+            client,
             message,
-            self.attachments,
-            self.mode,
-            &defaults,
-            overrides,
-        );
-        self.client
+            options,
+        } = self.send_request();
+        let defaults = client.runtime().defaults().await;
+        let body = options.into_new_conversation_request(message, &defaults);
+        client
             .post_stream("/rest/app-chat/conversations/new", &body)
             .await
     }
@@ -179,33 +163,30 @@ impl<'a> StartConversation<'a> {
 
 impl<'a, S> ContinueConversationBuilder<'a, S>
 where
-    S: continue_conversation_builder::State,
+    S: continue_conversation_builder::IsComplete,
 {
+    /// Submit the request and return a live stream handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or if the streaming response
+    /// cannot be decoded.
     pub async fn send(self) -> Result<StreamHandle> {
-        self.build().send().await
-    }
-}
-
-impl<'a> ContinueConversation<'a> {
-    async fn send(self) -> Result<StreamHandle> {
-        let overrides = self.overrides();
-        let message = self
-            .message
-            .ok_or_else(|| Error::Config(ConfigError::MissingRequired("message")))?;
-        let defaults = self.client.runtime().defaults().await;
-        let body = build_continue_conversation_request(
+        let ContinueConversation {
+            client,
+            conversation_id,
             message,
-            self.parent_response_id,
-            self.attachments,
-            self.mode,
-            &defaults,
-            overrides,
-        );
+            parent_response_id,
+            options,
+        } = self.send_request();
+        let defaults = client.runtime().defaults().await;
+        let body =
+            options.into_continue_conversation_request(message, parent_response_id, &defaults);
         let path = format!(
             "/rest/app-chat/conversations/{}/responses",
-            self.conversation_id.as_str()
+            conversation_id.as_str()
         );
-        self.client.post_stream(&path, &body).await
+        client.post_stream(&path, &body).await
     }
 }
 
@@ -300,71 +281,6 @@ impl<'a> GetConversation<'a> {
     }
 }
 
-impl<'a> StartConversation<'a> {
-    fn overrides(&self) -> BuilderOverrides {
-        BuilderOverrides {
-            disable_search: self.disable_search,
-            force_concise: self.force_concise,
-            disable_memory: self.disable_memory,
-            enable_gmail_search: self.enable_gmail_search,
-            enable_google_calendar_search: self.enable_google_calendar_search,
-            enable_outlook_search: self.enable_outlook_search,
-            enable_outlook_calendar_search: self.enable_outlook_calendar_search,
-            enable_google_drive_search: self.enable_google_drive_search,
-        }
-    }
-}
-
-impl<'a> ContinueConversation<'a> {
-    fn overrides(&self) -> BuilderOverrides {
-        BuilderOverrides {
-            disable_search: self.disable_search,
-            force_concise: self.force_concise,
-            disable_memory: self.disable_memory,
-            enable_gmail_search: self.enable_gmail_search,
-            enable_google_calendar_search: self.enable_google_calendar_search,
-            enable_outlook_search: self.enable_outlook_search,
-            enable_outlook_calendar_search: self.enable_outlook_calendar_search,
-            enable_google_drive_search: self.enable_google_drive_search,
-        }
-    }
-}
-
-fn build_new_conversation_request(
-    message: String,
-    attachments: Vec<FileMetadataId>,
-    mode: Option<Mode>,
-    defaults: &ChatDefaults,
-    overrides: BuilderOverrides,
-) -> NewConversationRequest {
-    NewConversationRequest {
-        temporary: false,
-        message,
-        file_attachments: attachments,
-        image_attachments: Vec::new(),
-        mode_id: mode.unwrap_or(defaults.mode.clone()),
-        options: build_chat_request_options(defaults, overrides),
-    }
-}
-
-fn build_continue_conversation_request(
-    message: String,
-    parent_response_id: Option<ResponseId>,
-    attachments: Vec<FileMetadataId>,
-    mode: Option<Mode>,
-    defaults: &ChatDefaults,
-    overrides: BuilderOverrides,
-) -> ContinueConversationRequest {
-    ContinueConversationRequest {
-        message,
-        parent_response_id,
-        file_attachments: attachments,
-        image_attachments: Vec::new(),
-        mode_id: mode,
-        options: build_chat_request_options(defaults, overrides),
-    }
-}
-
 pub(crate) fn count_response_message_chars(loaded_responses: &[LoadedResponse]) -> u64 {
     loaded_responses
         .iter()
@@ -372,41 +288,6 @@ pub(crate) fn count_response_message_chars(loaded_responses: &[LoadedResponse]) 
         .filter_map(|value| value.as_str())
         .map(|message| message.chars().count() as u64)
         .sum::<u64>()
-}
-
-#[derive(Default)]
-struct BuilderOverrides {
-    disable_search: Option<bool>,
-    force_concise: Option<bool>,
-    disable_memory: Option<bool>,
-    enable_gmail_search: Option<bool>,
-    enable_google_calendar_search: Option<bool>,
-    enable_outlook_search: Option<bool>,
-    enable_outlook_calendar_search: Option<bool>,
-    enable_google_drive_search: Option<bool>,
-}
-
-fn build_chat_request_options(
-    defaults: &ChatDefaults,
-    overrides: BuilderOverrides,
-) -> ChatRequestOptions {
-    ChatRequestOptions {
-        disable_search: overrides.disable_search.unwrap_or(defaults.disable_search),
-        force_concise: overrides.force_concise.unwrap_or(defaults.force_concise),
-        disable_memory: overrides.disable_memory.unwrap_or(defaults.disable_memory),
-        tool_overrides: ToolOverrides {
-            gmail_search: overrides.enable_gmail_search,
-            google_calendar_search: overrides.enable_google_calendar_search,
-            outlook_search: overrides.enable_outlook_search,
-            outlook_calendar_search: overrides.enable_outlook_calendar_search,
-            google_drive_search: overrides.enable_google_drive_search,
-        },
-        enable_image_generation: defaults.enable_image_generation,
-        image_generation_count: defaults.image_generation_count,
-        enable_side_by_side: defaults.enable_side_by_side,
-        disable_text_follow_ups: defaults.disable_text_follow_ups,
-        ..ChatRequestOptions::default()
-    }
 }
 
 fn urlencoding(raw: &str) -> String {
@@ -424,8 +305,11 @@ impl GrokClient {
 mod tests {
     use serde_json::json;
 
-    use super::{BuilderOverrides, ConversationEnvelope, build_chat_request_options};
-    use crate::config::ChatDefaults;
+    use super::ConversationEnvelope;
+    use crate::{
+        config::ChatDefaults,
+        models::{ChatOptions, IntegrationFlags},
+    };
 
     #[test]
     fn conversation_envelope_deserializes_wrapped_conversation() {
@@ -450,23 +334,22 @@ mod tests {
     }
 
     #[test]
-    fn build_chat_request_options_applies_builder_overrides() {
+    fn chat_options_into_wire_merges_defaults_and_overrides() {
         let defaults = ChatDefaults::default();
-        let options = build_chat_request_options(
-            &defaults,
-            BuilderOverrides {
-                disable_search: Some(true),
-                force_concise: Some(true),
-                disable_memory: Some(true),
-                enable_gmail_search: Some(true),
-                enable_google_calendar_search: None,
-                enable_outlook_search: Some(false),
-                enable_outlook_calendar_search: None,
-                enable_google_drive_search: Some(true),
-            },
-        );
+        let options = ChatOptions::builder()
+            .disable_search(true)
+            .force_concise(true)
+            .disable_memory(true)
+            .integrations(
+                IntegrationFlags::builder()
+                    .gmail(true)
+                    .outlook(false)
+                    .google_drive(true)
+                    .build(),
+            )
+            .build();
 
-        let value = serde_json::to_value(options).expect("serialize options");
+        let value = serde_json::to_value(options.into_wire(&defaults)).expect("serialize options");
 
         assert_eq!(value.get("disableSearch"), Some(&json!(true)));
         assert_eq!(value.get("forceConcise"), Some(&json!(true)));

@@ -90,9 +90,20 @@ pub struct StepThinking {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PollStatus {
+    /// Grok is still generating the response.
+    InProgress,
+    /// Response complete; [`PollOutput::result`] is populated.
+    Completed,
+    /// No response matches the given `(conversation_id, response_id)` pair.
+    NotFound,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct PollOutput {
-    /// `in_progress`, `completed`, or `not_found`
-    pub status: String,
+    /// Current state of the requested research result.
+    pub status: PollStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Box<FinalChatResult>>,
     #[serde(skip_serializing_if = "Option::is_none")]
