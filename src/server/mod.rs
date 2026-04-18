@@ -1,0 +1,970 @@
+//! MCP server surface: tool definitions, routing, and request handling.
+
+pub mod output;
+pub mod params;
+pub mod progress;
+pub mod schema_helpers;
+
+use std::{path::Path, sync::Arc};
+
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use rmcp::{
+    ErrorData, Json, RoleServer, ServerHandler,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{Implementation, ServerCapabilities, ServerInfo},
+    service::RequestContext,
+    tool, tool_handler, tool_router,
+};
+use serde_json::json;
+use tokio::time::MissedTickBehavior;
+
+use crate::{
+    client::{
+        GrokClient,
+        stream::{
+            Collector, extract_citations_from_card_attachments, extract_web_search_results,
+            merge_citations_from_message,
+        },
+    },
+    config::RuntimeState,
+    error::Error,
+    models::{
+        chat::{FinalChatResult, LoadedResponse},
+        common::{
+            AgentMessage, ConversationId, FollowUpSuggestion, Mode, ResponseId, ResponseStep,
+            ToolUsageCard, UserId, WebSearchResult,
+        },
+        subscriptions::{SubscriptionStatus, Tier},
+    },
+    server::{
+        output::{
+            AuthStatus, DefaultsOutput, GetConversationOutput, ListConversationsOutput, PollOutput,
+            RateLimitsOutput, ResearchStartOutput, StepThinking, UploadFileOutput,
+        },
+        params::{
+            AskParams, GetConversationParams, ListConversationsParams, PollParams,
+            RateLimitsParams, SetDefaultsParams, SkillsParams, UploadFileParams,
+        },
+        progress::{ProgressForwarder, extract_progress_token},
+    },
+};
+
+macro_rules! apply_research_options {
+    ($builder:expr, $params:expr) => {
+        $builder
+            .maybe_disable_search($params.disable_search)
+            .maybe_force_concise($params.force_concise)
+            .maybe_disable_memory($params.disable_memory)
+            .maybe_enable_gmail_search($params.enable_gmail_search)
+            .maybe_enable_google_calendar_search($params.enable_google_calendar_search)
+            .maybe_enable_outlook_search($params.enable_outlook_search)
+            .maybe_enable_outlook_calendar_search($params.enable_outlook_calendar_search)
+            .maybe_enable_google_drive_search($params.enable_google_drive_search)
+    };
+}
+
+/// MCP server that bridges an in-process agent to grok.com.
+///
+/// Cloning is cheap — [`GrokClient`] and [`RuntimeState`] wrap their inner state
+/// with `Arc`.
+#[derive(Clone)]
+pub struct Server {
+    client: Arc<GrokClient>,
+    runtime: RuntimeState,
+    tool_router: ToolRouter<Self>,
+}
+
+impl Server {
+    /// Wire a new server around an existing [`GrokClient`].
+    #[must_use]
+    pub fn new(client: GrokClient, runtime: RuntimeState) -> Self {
+        Self {
+            client: Arc::new(client),
+            runtime,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Return the full list of MCP tools this server exposes (name + description).
+    ///
+    /// The [`list_tools`](crate::Server::list_tools) subcommand renders this;
+    /// keeping it on the public surface lets external callers document the
+    /// server without constructing a transport.
+    #[must_use]
+    pub fn tools(&self) -> Vec<rmcp::model::Tool> {
+        self.tool_router.list_all()
+    }
+}
+
+#[tool_router(router = tool_router)]
+impl Server {
+    /// `grok_check_auth` — smoke-test the session by hitting `/rest/subscriptions`.
+    #[tool(
+        name = "grok_check_auth",
+        description = "Check that grok.com cookies still work. \
+        Returns the logged-in user id, subscription tier, and status."
+    )]
+    pub async fn grok_check_auth(&self) -> Result<Json<AuthStatus>, ErrorData> {
+        let subscriptions = self.client.subscriptions().await.map_err(Error::into_mcp)?;
+        let (user_id, tier, status, active_until) = match subscriptions.subscriptions.first() {
+            Some(sub) => (
+                Some(sub.xai_user_id.clone()),
+                Some(sub.tier.clone()),
+                Some(sub.status.clone()),
+                sub.stripe
+                    .as_ref()
+                    .and_then(|value| value.get("currentPeriodEnd"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned),
+            ),
+            None => (
+                None::<UserId>,
+                None::<Tier>,
+                None::<SubscriptionStatus>,
+                None,
+            ),
+        };
+        Ok(Json(AuthStatus {
+            authenticated: true,
+            user_id,
+            tier,
+            status,
+            active_until,
+        }))
+    }
+
+    /// `grok_rate_limits` — query remaining/total queries for the given mode.
+    #[tool(
+        name = "grok_rate_limits",
+        description = "Remaining query budget (per-mode rate limit). Defaults to the current runtime mode."
+    )]
+    pub async fn grok_rate_limits(
+        &self,
+        Parameters(params): Parameters<RateLimitsParams>,
+    ) -> Result<Json<RateLimitsOutput>, ErrorData> {
+        let defaults = self.runtime.defaults().await;
+        let mode = params.mode.unwrap_or(defaults.mode);
+        let limits = self
+            .client
+            .rate_limits(&mode)
+            .await
+            .map_err(Error::into_mcp)?;
+        Ok(Json(limits.into()))
+    }
+
+    /// `grok_list_skills` — built-in skills catalog.
+    #[tool(
+        name = "grok_list_skills",
+        description = "List grok.com built-in skills (catalog of tools Grok itself can invoke)."
+    )]
+    pub async fn grok_list_skills(
+        &self,
+        Parameters(params): Parameters<SkillsParams>,
+    ) -> Result<Json<crate::models::SkillsResponse>, ErrorData> {
+        let locale = params.locale.as_deref().unwrap_or("en");
+        let response = self.client.skills(locale).await.map_err(Error::into_mcp)?;
+        Ok(Json(response))
+    }
+
+    /// `grok_list_conversations` — paginated conversation list.
+    #[tool(
+        name = "grok_list_conversations",
+        description = "List grok.com conversations. Pass page_token from a prior response to paginate."
+    )]
+    pub async fn grok_list_conversations(
+        &self,
+        Parameters(params): Parameters<ListConversationsParams>,
+    ) -> Result<Json<ListConversationsOutput>, ErrorData> {
+        let list_builder = self
+            .client
+            .conversations()
+            .list()
+            .maybe_page_size(params.page_size)
+            .maybe_page_token(params.page_token);
+        let list = list_builder.send().await.map_err(Error::into_mcp)?;
+        Ok(Json(ListConversationsOutput {
+            conversations: list.conversations,
+            next_page_token: list.next_page_token,
+        }))
+    }
+
+    /// `grok_get_conversation` — fetch typed conversation metadata + optional thread.
+    #[tool(
+        name = "grok_get_conversation",
+        description = "Fetch a conversation. Set include_messages to also load the full message thread."
+    )]
+    pub async fn grok_get_conversation(
+        &self,
+        Parameters(params): Parameters<GetConversationParams>,
+    ) -> Result<Json<GetConversationOutput>, ErrorData> {
+        let output = self
+            .client
+            .conversations()
+            .get(params.conversation_id.as_str())
+            .maybe_include_messages(Some(params.include_messages))
+            .send()
+            .await
+            .map_err(Error::into_mcp)?;
+        Ok(Json(output))
+    }
+
+    /// `grok_research` — hero tool. Streams a deep-research chat response.
+    ///
+    /// When the caller leaves `mode` unset, this tool defaults to
+    /// [`Mode::Expert`] regardless of the runtime defaults — deep research is
+    /// what the tool is for, and the runtime default is reserved for
+    /// general-purpose tools (e.g. rate limits).
+    #[tool(
+        name = "grok_research",
+        description = "Deep research via Grok: web search, expert reasoning, tool use. \
+        Pass a conversation_id to continue a thread or omit to start fresh. \
+        Returns the full answer, thinking trace, cited sources, and tool-usage cards. \
+        WARNING: heavy expert queries can take several minutes and may exceed \
+        your MCP client timeout. For long research use grok_research_start + \
+        grok_research_poll instead to avoid timeouts."
+    )]
+    pub async fn grok_research(
+        &self,
+        Parameters(params): Parameters<AskParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<Json<FinalChatResult>, ErrorData> {
+        let effective_mode = params.mode.clone().unwrap_or(Mode::Expert);
+        let progress_token = extract_progress_token(&ctx.meta);
+        let mut forwarder = ProgressForwarder::new(progress_token, ctx.peer.clone());
+
+        let (mut stream, seed_conv_id) = self
+            .open_research_stream(&params, effective_mode)
+            .await
+            .map_err(Error::into_mcp)?;
+
+        let mut collector = Collector::new(seed_conv_id);
+        let mut heartbeat_ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        heartbeat_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                event = stream.next_event() => {
+                    let Some(event) = event.map_err(Error::into_mcp)? else {
+                        break;
+                    };
+                    forwarder.observe(&event).await;
+                    collector.ingest(event);
+                }
+                _ = heartbeat_ticker.tick() => {
+                    forwarder.heartbeat().await;
+                }
+            }
+        }
+        forwarder.finalize().await;
+        let mut result = collector.finish().map_err(Error::into_mcp)?;
+        if params.full_details {
+            let (steps, agent_messages) = self
+                .hydrate_response_steps(&result)
+                .await
+                .map_err(Error::into_mcp)?;
+            result.steps = steps;
+            result.agent_messages = agent_messages;
+        }
+        Ok(Json(result))
+    }
+
+    #[tool(
+        name = "grok_research_start",
+        description = "Start a long-running Grok research request without waiting for the \
+        full answer. Returns conversation_id and response_id immediately. \
+        Use grok_research_poll to retrieve the result when ready. Prefer \
+        this over grok_research for heavy expert queries that may exceed \
+        your client's timeout."
+    )]
+    pub async fn grok_research_start(
+        &self,
+        Parameters(params): Parameters<AskParams>,
+    ) -> Result<Json<ResearchStartOutput>, ErrorData> {
+        let effective_mode = params.mode.clone().unwrap_or(Mode::Expert);
+
+        let seed_conversation_id = params.conversation_id.clone();
+        let (mut stream, _) = self
+            .open_research_stream(&params, effective_mode)
+            .await
+            .map_err(Error::into_mcp)?;
+
+        let (conversation_id, response_id, parent_response_id) = stream
+            .drain_ids(seed_conversation_id)
+            .await
+            .map_err(Error::into_mcp)?;
+
+        Ok(Json(ResearchStartOutput {
+            conversation_id,
+            response_id,
+            parent_response_id,
+        }))
+    }
+
+    #[tool(
+        name = "grok_research_poll",
+        description = "Poll for a previously started research result. Returns the full \
+        answer when ready, or status 'in_progress' if Grok is still \
+        generating. Pass the conversation_id and response_id from \
+        grok_research_start. Set full_details=true to hydrate steps."
+    )]
+    pub async fn grok_research_poll(
+        &self,
+        Parameters(params): Parameters<PollParams>,
+    ) -> Result<Json<PollOutput>, ErrorData> {
+        let response_id = ResponseId::new(params.response_id);
+        let loaded = self
+            .client
+            .conversations()
+            .load_responses(&params.conversation_id, std::slice::from_ref(&response_id))
+            .await
+            .map_err(Error::into_mcp)?;
+        let Some(loaded_response) = loaded
+            .responses
+            .into_iter()
+            .find(|response| response.response_id == response_id)
+        else {
+            return Ok(Json(PollOutput {
+                status: "not_found".to_owned(),
+                result: None,
+                thinking_steps: None,
+            }));
+        };
+
+        if response_is_partial(&loaded_response) {
+            return Ok(Json(PollOutput {
+                status: "in_progress".to_owned(),
+                result: None,
+                thinking_steps: None,
+            }));
+        }
+
+        let conversation_id = ConversationId::new(params.conversation_id);
+        let mut result = build_result_from_loaded_response(conversation_id, &loaded_response)
+            .map_err(Error::into_mcp)?;
+        let thinking_steps = if params.include_thinking {
+            Some(extract_step_thinking(&loaded_response.steps))
+        } else {
+            None
+        };
+        if params.full_details {
+            let agent_messages = extract_agent_messages(&loaded_response.steps);
+            result.agent_messages = agent_messages;
+            result.steps = Some(loaded_response.steps.clone());
+        }
+
+        Ok(Json(PollOutput {
+            status: "completed".to_owned(),
+            result: Some(Box::new(result)),
+            thinking_steps,
+        }))
+    }
+
+    /// `grok_upload_file` — JSON+base64 upload.
+    #[tool(
+        name = "grok_upload_file",
+        description = "Upload a file and get back an attachment id to pass into grok_research. \
+        Provide content_base64 or local_path."
+    )]
+    pub async fn grok_upload_file(
+        &self,
+        Parameters(params): Parameters<UploadFileParams>,
+    ) -> Result<Json<UploadFileOutput>, ErrorData> {
+        let bytes = load_upload_bytes(&params).await?;
+        let mime = params
+            .mime_type
+            .clone()
+            .or_else(|| guess_mime_from_name(&params.file_name))
+            .unwrap_or_else(|| "application/octet-stream".to_owned());
+        let response = self
+            .client
+            .uploads()
+            .upload()
+            .file_name(params.file_name)
+            .mime_type(mime)
+            .content_base64(BASE64_STANDARD.encode(bytes))
+            .send()
+            .await
+            .map_err(Error::into_mcp)?;
+        Ok(Json(UploadFileOutput {
+            file_metadata_id: response.file_metadata_id,
+            file_uri: response.file_uri,
+            mime_type: response.file_mime_type,
+            file_name: response.file_name,
+            create_time: response.create_time,
+        }))
+    }
+
+    /// `grok_get_defaults` — current runtime defaults.
+    #[tool(
+        name = "grok_get_defaults",
+        description = "Read the current runtime defaults (mode + flags)."
+    )]
+    pub async fn grok_get_defaults(&self) -> Result<Json<DefaultsOutput>, ErrorData> {
+        let defaults = self.runtime.defaults().await;
+        Ok(Json(DefaultsOutput { defaults }))
+    }
+
+    /// `grok_set_defaults` — mutate runtime defaults.
+    #[tool(
+        name = "grok_set_defaults",
+        description = "Override runtime defaults in-memory (not persisted). \
+        Only fields you pass are changed; returns the full post-update snapshot."
+    )]
+    pub async fn grok_set_defaults(
+        &self,
+        Parameters(params): Parameters<SetDefaultsParams>,
+    ) -> Result<Json<DefaultsOutput>, ErrorData> {
+        let mut current = self.runtime.defaults().await;
+        if let Some(mode) = params.mode {
+            current.mode = mode;
+        }
+        if let Some(flag) = params.disable_search {
+            current.disable_search = flag;
+        }
+        if let Some(flag) = params.force_concise {
+            current.force_concise = flag;
+        }
+        if let Some(flag) = params.disable_memory {
+            current.disable_memory = flag;
+        }
+        if let Some(flag) = params.enable_image_generation {
+            current.enable_image_generation = flag;
+        }
+        if let Some(count) = params.image_generation_count {
+            current.image_generation_count = count;
+        }
+        if let Some(flag) = params.enable_side_by_side {
+            current.enable_side_by_side = flag;
+        }
+        if let Some(flag) = params.disable_text_follow_ups {
+            current.disable_text_follow_ups = flag;
+        }
+        let snapshot = self.runtime.replace(current).await;
+        Ok(Json(DefaultsOutput { defaults: snapshot }))
+    }
+}
+
+impl Server {
+    async fn open_research_stream(
+        &self,
+        params: &AskParams,
+        effective_mode: Mode,
+    ) -> crate::error::Result<(crate::client::stream::StreamHandle, Option<ConversationId>)> {
+        match params.conversation_id.clone() {
+            Some(conv_id) => {
+                let builder = apply_research_options!(
+                    self.client
+                        .conversations()
+                        .continue_(conv_id.as_str())
+                        .message(params.message.clone())
+                        .mode(effective_mode)
+                        .attachments(params.attachments.clone())
+                        .maybe_parent_response_id(params.parent_response_id.clone()),
+                    params
+                );
+                let handle = builder.send().await?;
+                Ok((handle, Some(conv_id)))
+            }
+            None => {
+                let builder = apply_research_options!(
+                    self.client
+                        .conversations()
+                        .start()
+                        .message(params.message.clone())
+                        .mode(effective_mode)
+                        .attachments(params.attachments.clone()),
+                    params
+                );
+                let handle = builder.send().await?;
+                Ok((handle, None))
+            }
+        }
+    }
+
+    async fn hydrate_response_steps(
+        &self,
+        result: &FinalChatResult,
+    ) -> crate::error::Result<(Option<Vec<ResponseStep>>, Vec<AgentMessage>)> {
+        let conversation_id = result.conversation_id.as_str();
+        let response_id = &result.response_id;
+        let node_result = self
+            .client
+            .conversations()
+            .response_node(conversation_id, true)
+            .await?;
+        let has_response = node_result
+            .response_nodes
+            .iter()
+            .any(|node| &node.response_id == response_id);
+        if !has_response {
+            return Ok((None, Vec::new()));
+        }
+
+        let loaded = self
+            .client
+            .conversations()
+            .load_responses(conversation_id, std::slice::from_ref(response_id))
+            .await?;
+        let steps = loaded
+            .responses
+            .into_iter()
+            .find(|response| response.response_id == *response_id)
+            .map(|response| response.steps);
+        let agent_messages = steps
+            .as_ref()
+            .map(|steps| extract_agent_messages(steps))
+            .unwrap_or_default();
+
+        Ok((steps, agent_messages))
+    }
+}
+
+fn build_result_from_loaded_response(
+    conversation_id: ConversationId,
+    loaded: &LoadedResponse,
+) -> crate::error::Result<FinalChatResult> {
+    let message = loaded
+        .extra
+        .get("message")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let parent_response_id = loaded
+        .extra
+        .get("parentResponseId")
+        .and_then(|value| value.as_str())
+        .map(ResponseId::new);
+    let title = loaded
+        .extra
+        .get("title")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let follow_up_suggestions = loaded
+        .extra
+        .get("followUpSuggestions")
+        .cloned()
+        .map(serde_json::from_value::<Vec<FollowUpSuggestion>>)
+        .transpose()
+        .map_err(crate::error::Error::Serde)?
+        .unwrap_or_default();
+    let web_search_results = match loaded.extra.get("webSearchResults") {
+        Some(value) => extract_web_search_results(value.clone())?,
+        None => loaded
+            .steps
+            .iter()
+            .flat_map(|step| step.web_search_results.iter().cloned())
+            .collect::<Vec<WebSearchResult>>(),
+    };
+    let card_attachments = loaded
+        .extra
+        .get("cardAttachmentsJson")
+        .map(extract_citations_from_card_attachments)
+        .unwrap_or_default();
+    let citations = merge_citations_from_message(&message, &card_attachments);
+    let tool_usage_cards = loaded
+        .steps
+        .iter()
+        .flat_map(|step| step.tool_usage_cards.iter().cloned())
+        .fold(Vec::<ToolUsageCard>::new(), |mut cards, card| {
+            if !cards
+                .iter()
+                .any(|existing| existing.tool_usage_card_id == card.tool_usage_card_id)
+            {
+                cards.push(card);
+            }
+            cards
+        });
+
+    Ok(FinalChatResult {
+        conversation_id,
+        response_id: loaded.response_id.clone(),
+        parent_response_id,
+        message,
+        thinking: None,
+        citations,
+        tool_usage_cards,
+        web_search_results,
+        follow_up_suggestions,
+        title,
+        steps: None,
+        agent_messages: Vec::new(),
+        unknown_events: Vec::new(),
+    })
+}
+
+fn response_is_partial(loaded: &LoadedResponse) -> bool {
+    loaded
+        .extra
+        .get("partial")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn extract_agent_messages(steps: &[ResponseStep]) -> Vec<AgentMessage> {
+    steps
+        .iter()
+        .flat_map(|step| {
+            step.tool_usage_cards.iter().filter_map(|card| {
+                let from = step.rollout_id.clone()?;
+                let chatroom_send = card.extra.get("chatroomSend")?.as_object()?;
+                let payload = chatroom_send
+                    .get("args")
+                    .and_then(|value| value.as_object())
+                    .unwrap_or(chatroom_send);
+                let to = payload.get("to")?.as_str()?.to_owned();
+                let text = payload.get("message")?.as_str()?.to_owned();
+
+                Some(AgentMessage { from, to, text })
+            })
+        })
+        .collect::<Vec<AgentMessage>>()
+}
+
+fn extract_step_thinking(steps: &[ResponseStep]) -> Vec<StepThinking> {
+    steps
+        .iter()
+        .map(|step| StepThinking {
+            rollout_id: step.rollout_id.clone(),
+            tags: step.tags.clone(),
+            text: step.text.join("\n"),
+        })
+        .collect::<Vec<StepThinking>>()
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for Server {
+    fn get_info(&self) -> ServerInfo {
+        // No `with_protocol_version` call: `ServerInfo::new` defaults to the
+        // LATEST protocol version (2025-11-25 on pinned rmcp). Recent MCP
+        // clients (opencode 1.4.7+, current Claude Desktop) require this;
+        // rmcp negotiates downward for older clients.
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("grok-mcp", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
+                "Bridges a local agent to grok.com via browser-cookie auth. The hero tool is grok_research. Check auth with grok_check_auth before long runs.",
+            )
+    }
+}
+
+async fn load_upload_bytes(params: &UploadFileParams) -> Result<Vec<u8>, ErrorData> {
+    match (&params.content_base64, &params.local_path) {
+        (Some(content), None) => BASE64_STANDARD.decode(content.as_bytes()).map_err(|error| {
+            ErrorData::invalid_params(format!("content_base64 is not valid base64: {error}"), None)
+        }),
+        (None, Some(path)) => tokio::fs::read(Path::new(path)).await.map_err(|error| {
+            ErrorData::invalid_params(
+                format!("failed to read local_path {path}: {error}"),
+                Some(json!({ "path": path })),
+            )
+        }),
+        (Some(_), Some(_)) => Err(ErrorData::invalid_params(
+            "specify exactly one of content_base64 or local_path",
+            None,
+        )),
+        (None, None) => Err(ErrorData::invalid_params(
+            "one of content_base64 or local_path must be provided",
+            None,
+        )),
+    }
+}
+
+fn guess_mime_from_name(name: &str) -> Option<String> {
+    let ext = Path::new(name).extension()?.to_str()?.to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "txt" | "md" | "markdown" => "text/plain",
+        "json" => "application/json",
+        "html" | "htm" => "text/html",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "csv" => "text/csv",
+        "py" => "text/x-python",
+        "rs" => "text/rust",
+        _ => return None,
+    };
+    Some(mime.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        GetConversationOutput, PollOutput, build_result_from_loaded_response,
+        extract_agent_messages, extract_step_thinking,
+    };
+    use crate::{
+        models::{
+            ConversationId, FinalChatResult, LoadedResponse, ResponseStep, RolloutId, ToolUsageCard,
+        },
+        server::output::StepThinking,
+    };
+
+    #[test]
+    fn extract_agent_messages_reads_chatroom_send_cards() {
+        let step = ResponseStep {
+            text: vec!["done".to_owned()],
+            tags: vec!["final".to_owned()],
+            rollout_id: Some(RolloutId::new("Agent 1")),
+            message_step_id: None,
+            web_search_results: Vec::new(),
+            tool_usage_cards: vec![
+                serde_json::from_value::<ToolUsageCard>(json!({
+                    "toolUsageCardId": "tool-card-1",
+                    "chatroomSend": {
+                        "args": {
+                            "to": "Grok",
+                            "message": "Search complete"
+                        }
+                    }
+                }))
+                .expect("tool card"),
+            ],
+            tool_usage_results: Vec::new(),
+            extra: serde_json::Map::new(),
+        };
+
+        let messages = extract_agent_messages(&[step]);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].from.as_str(), "Agent 1");
+        assert_eq!(messages[0].to, "Grok");
+        assert_eq!(messages[0].text, "Search complete");
+    }
+
+    #[test]
+    fn build_result_from_loaded_response_populates_citations_cards_and_agent_messages() {
+        let loaded = LoadedResponse {
+            response_id: crate::models::ResponseId::new("r1"),
+            steps: vec![ResponseStep {
+                text: vec!["done".to_owned()],
+                tags: vec!["final".to_owned()],
+                rollout_id: Some(RolloutId::new("Agent 1")),
+                message_step_id: None,
+                web_search_results: Vec::new(),
+                tool_usage_cards: vec![
+                    serde_json::from_value::<ToolUsageCard>(json!({
+                        "toolUsageCardId": "tool-card-1",
+                        "chatroomSend": {
+                            "args": {
+                                "to": "Grok",
+                                "message": "done"
+                            }
+                        }
+                    }))
+                    .expect("tool card"),
+                ],
+                tool_usage_results: Vec::new(),
+                extra: serde_json::Map::new(),
+            }],
+            extra: serde_json::from_value(json!({
+                "message": concat!(
+                    "Answer <grok:render card_id=\"card-1\" card_type=\"citation_card\" type=\"render_inline_citation\">",
+                    "<argument name=\"citation_id\">5</argument></grok:render>"
+                ),
+                "partial": false,
+                "parentResponseId": "p1",
+                "title": "async title",
+                "cardAttachmentsJson": [
+                    "{\"id\":\"card-1\",\"cardType\":\"citation_card\",\"url\":\"https://example.com\"}"
+                ]
+            }))
+            .expect("extra map"),
+        };
+
+        let mut result = build_result_from_loaded_response(ConversationId::new("c1"), &loaded)
+            .expect("result from loaded response");
+        result.agent_messages = extract_agent_messages(&loaded.steps);
+
+        assert_eq!(result.conversation_id.as_str(), "c1");
+        assert_eq!(result.response_id.as_str(), "r1");
+        assert_eq!(result.parent_response_id.expect("parent").as_str(), "p1");
+        assert_eq!(result.thinking, None);
+        assert_eq!(result.title.as_deref(), Some("async title"));
+        assert_eq!(result.citations.len(), 1);
+        assert_eq!(result.citations[0].card_id, "card-1");
+        assert_eq!(result.citations[0].citation_id.as_deref(), Some("5"));
+        assert_eq!(
+            result.citations[0].url.as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(result.tool_usage_cards.len(), 1);
+        assert_eq!(result.agent_messages.len(), 1);
+        assert_eq!(result.agent_messages[0].from.as_str(), "Agent 1");
+    }
+
+    #[test]
+    fn poll_output_serializes_with_expected_status_shapes() {
+        let in_progress = serde_json::to_value(PollOutput {
+            status: "in_progress".to_owned(),
+            result: None,
+            thinking_steps: None,
+        })
+        .expect("serialize in progress");
+        assert_eq!(
+            in_progress.get("status").and_then(|value| value.as_str()),
+            Some("in_progress")
+        );
+        assert_eq!(in_progress.get("result"), None);
+
+        let completed = serde_json::to_value(PollOutput {
+            status: "completed".to_owned(),
+            result: Some(Box::new(FinalChatResult {
+                conversation_id: ConversationId::new("c1"),
+                response_id: crate::models::ResponseId::new("r1"),
+                parent_response_id: None,
+                message: "done".to_owned(),
+                thinking: None,
+                citations: Vec::new(),
+                tool_usage_cards: Vec::new(),
+                web_search_results: Vec::new(),
+                follow_up_suggestions: Vec::new(),
+                title: None,
+                steps: None,
+                agent_messages: Vec::new(),
+                unknown_events: Vec::new(),
+            })),
+            thinking_steps: Some(vec![StepThinking {
+                rollout_id: Some(RolloutId::new("Agent 1")),
+                tags: vec!["analysis".to_owned()],
+                text: "reasoning".to_owned(),
+            }]),
+        })
+        .expect("serialize completed");
+        assert_eq!(
+            completed.get("status").and_then(|value| value.as_str()),
+            Some("completed")
+        );
+        assert!(completed.get("result").is_some());
+        assert!(completed.get("thinking_steps").is_some());
+    }
+
+    #[test]
+    fn extract_step_thinking_joins_text_fragments_with_newlines() {
+        let steps = vec![ResponseStep {
+            text: vec!["line one".to_owned(), "line two".to_owned()],
+            tags: vec!["analysis".to_owned()],
+            rollout_id: Some(RolloutId::new("Agent 2")),
+            message_step_id: None,
+            web_search_results: Vec::new(),
+            tool_usage_cards: Vec::new(),
+            tool_usage_results: Vec::new(),
+            extra: serde_json::Map::new(),
+        }];
+
+        let thinking = extract_step_thinking(&steps);
+
+        assert_eq!(thinking.len(), 1);
+        assert_eq!(
+            thinking[0].rollout_id.as_ref().expect("rollout").as_str(),
+            "Agent 2"
+        );
+        assert_eq!(thinking[0].tags, vec!["analysis"]);
+        assert_eq!(thinking[0].text, "line one\nline two");
+    }
+
+    #[test]
+    fn get_conversation_output_serializes_summary_fields() {
+        let output = GetConversationOutput {
+            conversation: serde_json::from_value(json!({
+                "conversationId": "c1",
+                "title": "t",
+                "starred": false,
+                "createTime": "2026-04-18T00:00:00Z",
+                "modifyTime": "2026-04-18T00:00:00Z",
+                "systemPromptName": "",
+                "temporary": false
+            }))
+            .expect("conversation"),
+            response_nodes: None,
+            responses: None,
+            message_count: 2,
+            total_chars: 7,
+        };
+
+        let value = serde_json::to_value(output).expect("serialize output");
+
+        assert_eq!(
+            value.get("message_count").and_then(|value| value.as_u64()),
+            Some(2)
+        );
+        assert_eq!(
+            value.get("total_chars").and_then(|value| value.as_u64()),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn get_conversation_output_omits_optional_thread_fields_when_none() {
+        let output = GetConversationOutput {
+            conversation: serde_json::from_value(json!({
+                "conversationId": "c1",
+                "title": "t",
+                "starred": false,
+                "createTime": "2026-04-18T00:00:00Z",
+                "modifyTime": "2026-04-18T00:00:00Z",
+                "systemPromptName": "",
+                "temporary": false
+            }))
+            .expect("conversation"),
+            response_nodes: None,
+            responses: None,
+            message_count: 0,
+            total_chars: 0,
+        };
+
+        let value = serde_json::to_value(output).expect("serialize output");
+
+        assert_eq!(value.get("response_nodes"), None);
+        assert_eq!(value.get("responses"), None);
+        assert_eq!(
+            value.get("message_count").and_then(|value| value.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            value.get("total_chars").and_then(|value| value.as_u64()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn get_conversation_summary_counts_only_response_messages() {
+        let loaded_responses = [
+            LoadedResponse {
+                response_id: crate::models::ResponseId::new("r1"),
+                steps: Vec::new(),
+                extra: serde_json::from_value(json!({
+                    "message": "hello",
+                    "metadata": { "ignored": true },
+                    "title": "not counted"
+                }))
+                .expect("extra map"),
+            },
+            LoadedResponse {
+                response_id: crate::models::ResponseId::new("r2"),
+                steps: Vec::new(),
+                extra: serde_json::from_value(json!({
+                    "message": "世界",
+                    "otherText": "ignored"
+                }))
+                .expect("extra map"),
+            },
+            LoadedResponse {
+                response_id: crate::models::ResponseId::new("r3"),
+                steps: Vec::new(),
+                extra: serde_json::from_value(json!({
+                    "metadata": { "message": "ignored nested" }
+                }))
+                .expect("extra map"),
+            },
+        ];
+
+        let message_count = u32::try_from(loaded_responses.len()).expect("count fits u32");
+        let total_chars =
+            crate::client::conversations::count_response_message_chars(&loaded_responses);
+
+        assert_eq!(message_count, 3);
+        assert_eq!(total_chars, 7);
+    }
+}
