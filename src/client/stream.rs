@@ -1024,14 +1024,22 @@ mod tests {
     async fn drain_ids_returns_before_consuming_later_frames() {
         use futures_util::stream;
 
-        let conv_line = r#"{"result":{"conversation":{"conversationId":"c1","title":"t","starred":false,"createTime":"2026-04-17T00:00:00Z","modifyTime":"2026-04-17T00:00:00Z","systemPromptName":"","temporary":false}}}
-"#;
-        let user_line = r#"{"result":{"response":{"userResponse":{"responseId":"user-echo-1","message":"hello","parentResponseId":"p1"}}}}
-"#;
-        let token_line = r#"{"result":{"response":{"token":"working","messageTag":"summary","responseId":"assistant-1","isThinking":true,"isSoftStop":false}}}
-"#;
-        let model_line = r#"{"result":{"response":{"modelResponse":{"responseId":"assistant-1","message":"done","parentResponseId":"p1"}}}}
-"#;
+        let conv_line = concat!(
+            r#"{"result":{"conversation":{"conversationId":"c1","title":"t","starred":false,"createTime":"2026-04-17T00:00:00Z","modifyTime":"2026-04-17T00:00:00Z","systemPromptName":"","temporary":false}}}"#,
+            "\n",
+        );
+        let user_line = concat!(
+            r#"{"result":{"response":{"userResponse":{"responseId":"user-echo-1","message":"hello","parentResponseId":"p1"}}}}"#,
+            "\n",
+        );
+        let token_line = concat!(
+            r#"{"result":{"response":{"token":"working","messageTag":"summary","responseId":"assistant-1","isThinking":true,"isSoftStop":false}}}"#,
+            "\n",
+        );
+        let model_line = concat!(
+            r#"{"result":{"response":{"modelResponse":{"responseId":"assistant-1","message":"done","parentResponseId":"p1"}}}}"#,
+            "\n",
+        );
 
         let chunks: Vec<Result<bytes::Bytes>> = vec![
             Ok(bytes::Bytes::from(conv_line)),
@@ -1064,10 +1072,14 @@ mod tests {
     async fn drain_ids_accepts_seeded_conversation_for_continuations() {
         use futures_util::stream;
 
-        let user_line = r#"{"result":{"userResponse":{"responseId":"user-echo-cont","message":"hello","parentResponseId":"p1"}}}
-"#;
-        let token_line = r#"{"result":{"token":"working","messageTag":"summary","responseId":"assistant-cont","isThinking":true,"isSoftStop":false}}
-"#;
+        let user_line = concat!(
+            r#"{"result":{"userResponse":{"responseId":"user-echo-cont","message":"hello","parentResponseId":"p1"}}}"#,
+            "\n",
+        );
+        let token_line = concat!(
+            r#"{"result":{"token":"working","messageTag":"summary","responseId":"assistant-cont","isThinking":true,"isSoftStop":false}}"#,
+            "\n",
+        );
 
         let chunks: Vec<Result<bytes::Bytes>> = vec![
             Ok(bytes::Bytes::from(user_line)),
@@ -1093,10 +1105,14 @@ mod tests {
     async fn drain_ids_fails_for_continuation_without_conversation_frame() {
         use futures_util::stream;
 
-        let user_line = r#"{"result":{"userResponse":{"responseId":"user-echo-only","message":"hello","parentResponseId":"p1"}}}
-"#;
-        let token_line = r#"{"result":{"token":"working","messageTag":"summary","responseId":"assistant-only","isThinking":true,"isSoftStop":false}}
-"#;
+        let user_line = concat!(
+            r#"{"result":{"userResponse":{"responseId":"user-echo-only","message":"hello","parentResponseId":"p1"}}}"#,
+            "\n",
+        );
+        let token_line = concat!(
+            r#"{"result":{"token":"working","messageTag":"summary","responseId":"assistant-only","isThinking":true,"isSoftStop":false}}"#,
+            "\n",
+        );
 
         let chunks: Vec<Result<bytes::Bytes>> = vec![
             Ok(bytes::Bytes::from(user_line)),
@@ -1128,10 +1144,14 @@ mod tests {
     async fn idle_timeout_does_not_trip_when_chunks_arrive_in_time() {
         use futures_util::stream;
 
-        let conv_line = r#"{"result":{"conversation":{"conversationId":"c1","title":"t","starred":false,"createTime":"2026-04-17T00:00:00Z","modifyTime":"2026-04-17T00:00:00Z","systemPromptName":"","temporary":false}}}
-"#;
-        let model_line = r#"{"result":{"response":{"modelResponse":{"responseId":"r1","message":"hello","sender":"ASSISTANT","parentResponseId":"p1"}}}}
-"#;
+        let conv_line = concat!(
+            r#"{"result":{"conversation":{"conversationId":"c1","title":"t","starred":false,"createTime":"2026-04-17T00:00:00Z","modifyTime":"2026-04-17T00:00:00Z","systemPromptName":"","temporary":false}}}"#,
+            "\n",
+        );
+        let model_line = concat!(
+            r#"{"result":{"response":{"modelResponse":{"responseId":"r1","message":"hello","sender":"ASSISTANT","parentResponseId":"p1"}}}}"#,
+            "\n",
+        );
 
         let chunks: Vec<Result<bytes::Bytes>> = vec![
             Ok(bytes::Bytes::from(conv_line)),
@@ -1151,8 +1171,10 @@ mod tests {
 
         use futures_util::stream::{self, Stream, StreamExt};
 
-        let conv_line = r#"{"result":{"conversation":{"conversationId":"c1","title":"t","starred":false,"createTime":"2026-04-17T00:00:00Z","modifyTime":"2026-04-17T00:00:00Z","systemPromptName":"","temporary":false}}}
-"#;
+        let conv_line = concat!(
+            r#"{"result":{"conversation":{"conversationId":"c1","title":"t","starred":false,"createTime":"2026-04-17T00:00:00Z","modifyTime":"2026-04-17T00:00:00Z","systemPromptName":"","temporary":false}}}"#,
+            "\n",
+        );
         // First chunk arrives immediately, then a 60-second stall — well past
         // the 5-second idle budget. We wrap each item in a short delay so the
         // stream actually yields to the runtime between items.
@@ -1180,10 +1202,14 @@ mod tests {
     async fn idle_timeout_disabled_when_zero() {
         use futures_util::stream;
 
-        let conv_line = r#"{"result":{"conversation":{"conversationId":"c1","title":"t","starred":false,"createTime":"2026-04-17T00:00:00Z","modifyTime":"2026-04-17T00:00:00Z","systemPromptName":"","temporary":false}}}
-"#;
-        let model_line = r#"{"result":{"response":{"modelResponse":{"responseId":"r1","message":"hello","sender":"ASSISTANT","parentResponseId":"p1"}}}}
-"#;
+        let conv_line = concat!(
+            r#"{"result":{"conversation":{"conversationId":"c1","title":"t","starred":false,"createTime":"2026-04-17T00:00:00Z","modifyTime":"2026-04-17T00:00:00Z","systemPromptName":"","temporary":false}}}"#,
+            "\n",
+        );
+        let model_line = concat!(
+            r#"{"result":{"response":{"modelResponse":{"responseId":"r1","message":"hello","sender":"ASSISTANT","parentResponseId":"p1"}}}}"#,
+            "\n",
+        );
         let chunks: Vec<Result<bytes::Bytes>> = vec![
             Ok(bytes::Bytes::from(conv_line)),
             Ok(bytes::Bytes::from(model_line)),
