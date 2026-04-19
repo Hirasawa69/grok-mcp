@@ -316,7 +316,7 @@ impl Server {
             }));
         };
 
-        if response_is_partial(&loaded_response) {
+        if !response_is_ready(&loaded_response) {
             return Ok(Json(PollOutput {
                 status: PollStatus::InProgress,
                 result: None,
@@ -576,12 +576,27 @@ fn build_result_from_loaded_response(
     })
 }
 
-fn response_is_partial(loaded: &LoadedResponse) -> bool {
-    loaded
+fn response_is_ready(loaded: &LoadedResponse) -> bool {
+    // `partial: true` definitively blocks readiness — Grok is still streaming.
+    // `partial: false` is NOT a reliable "ready" signal: grok.com stamps it
+    // on the response record at creation time, before generation starts, so
+    // we also require actual content (non-empty `message` or at least one
+    // step). Missing `partial` field is treated the same as `false`.
+    let partial_true = loaded
         .extra
         .get("partial")
         .and_then(|value| value.as_bool())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if partial_true {
+        return false;
+    }
+
+    let has_message = loaded
+        .extra
+        .get("message")
+        .and_then(|value| value.as_str())
+        .is_some_and(|text| !text.is_empty());
+    has_message || !loaded.steps.is_empty()
 }
 
 fn extract_agent_messages(steps: &[ResponseStep]) -> Vec<AgentMessage> {
@@ -694,7 +709,7 @@ mod tests {
 
     use super::{
         GetConversationOutput, PollOutput, build_result_from_loaded_response,
-        extract_agent_messages, extract_step_thinking,
+        extract_agent_messages, extract_step_thinking, response_is_ready,
     };
     use crate::{
         models::{
@@ -840,6 +855,74 @@ mod tests {
         );
         assert!(completed.get("result").is_some());
         assert!(completed.get("thinking_steps").is_some());
+    }
+
+    fn loaded_response(extra: serde_json::Value, steps: Vec<ResponseStep>) -> LoadedResponse {
+        LoadedResponse {
+            response_id: crate::models::ResponseId::new("r1"),
+            steps,
+            extra: serde_json::from_value(extra).expect("extra map"),
+        }
+    }
+
+    fn draft_step() -> ResponseStep {
+        ResponseStep {
+            text: vec!["draft".to_owned()],
+            tags: Vec::new(),
+            rollout_id: None,
+            message_step_id: None,
+            web_search_results: Vec::new(),
+            tool_usage_cards: Vec::new(),
+            tool_usage_results: Vec::new(),
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn response_is_ready_false_when_partial_true_even_with_message() {
+        let loaded = loaded_response(json!({ "partial": true, "message": "half" }), Vec::new());
+        assert!(!response_is_ready(&loaded));
+    }
+
+    #[test]
+    fn response_is_ready_false_when_partial_false_but_no_content() {
+        // Observed on the wire: grok.com writes `partial: false` the moment a
+        // response row is created, before any content exists. The poll must
+        // stay InProgress in this state.
+        let loaded = loaded_response(json!({ "partial": false }), Vec::new());
+        assert!(!response_is_ready(&loaded));
+    }
+
+    #[test]
+    fn response_is_ready_false_when_partial_missing_and_no_content() {
+        let loaded = loaded_response(json!({}), Vec::new());
+        assert!(!response_is_ready(&loaded));
+    }
+
+    #[test]
+    fn response_is_ready_false_when_message_empty() {
+        let loaded = loaded_response(json!({ "partial": false, "message": "" }), Vec::new());
+        assert!(!response_is_ready(&loaded));
+    }
+
+    #[test]
+    fn response_is_ready_true_when_message_present() {
+        let loaded = loaded_response(json!({ "partial": false, "message": "done" }), Vec::new());
+        assert!(response_is_ready(&loaded));
+    }
+
+    #[test]
+    fn response_is_ready_true_when_steps_present_even_with_empty_message() {
+        let loaded = loaded_response(json!({ "partial": false }), vec![draft_step()]);
+        assert!(response_is_ready(&loaded));
+    }
+
+    #[test]
+    fn response_is_ready_false_when_partial_true_blocks_despite_steps() {
+        // `partial: true` takes precedence — if Grok is still streaming,
+        // don't report ready even when partial steps have arrived.
+        let loaded = loaded_response(json!({ "partial": true }), vec![draft_step()]);
+        assert!(!response_is_ready(&loaded));
     }
 
     #[test]

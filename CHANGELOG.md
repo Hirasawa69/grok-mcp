@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `apply_research_options!` and the private conversation-builder override
   helpers, now replaced by `ChatOptions` conversions.
 
+### Fixed
+- `grok_research_poll` no longer reports `status: "completed"` with an empty
+  `message` while Grok is still generating. Readiness now requires actual
+  content (non-empty `message` or at least one step) in the loaded response:
+  grok.com stamps `partial: false` on the response record at creation time,
+  before any content exists, so `partial: false` alone is not a reliable
+  readiness signal. `partial: true` still blocks readiness as before.
+
 ## [0.1.0] — 2026-04-18
 
 ### Added
