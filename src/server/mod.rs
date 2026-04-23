@@ -44,7 +44,8 @@ use crate::{
         },
         params::{
             AskParams, GetConversationParams, ListConversationsParams, PollParams,
-            RateLimitsParams, SetDefaultsParams, SkillsParams, UploadFileParams,
+            RateLimitsParams, SetDefaultsParams, SkillsParams, UploadFileParams, Verbosity,
+            resolve_verbosity,
         },
         progress::{ProgressForwarder, extract_progress_token},
     },
@@ -203,18 +204,28 @@ impl Server {
     /// general-purpose tools (e.g. rate limits).
     #[tool(
         name = "grok_research",
-        description = "Deep research via Grok: web search, expert reasoning, tool use. \
-        Pass a conversation_id to continue a thread or omit to start fresh. \
-        Returns the full answer, thinking trace, cited sources, and tool-usage cards. \
-        WARNING: heavy expert queries can take several minutes and may exceed \
-        your MCP client timeout. For long research use grok_research_start + \
-        grok_research_poll instead to avoid timeouts."
+        description = "Deep research via Grok in a single call. Streams the answer and \
+        blocks until complete. Returns conversation_id, response_id, message, and \
+        (by default) citations + web search + thinking. \
+        \
+        Use this ONLY for: (1) non-expert modes (auto/fast) where latency is \
+        predictable, OR (2) expert queries you expect to complete within your \
+        MCP client's tool-call timeout (typically 60-120s). \
+        \
+        For expert-mode heavy research, prefer grok_research_start + \
+        grok_research_poll — if this call exceeds the client timeout, the answer \
+        is LOST and cannot be recovered. \
+        \
+        Pass verbosity=\"minimal\" if you only need the answer; \"standard\" \
+        (default) for web search + citations + thinking; \"full\" for per-step \
+        reasoning (one extra HTTP round-trip)."
     )]
     pub async fn grok_research(
         &self,
         Parameters(params): Parameters<AskParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<FinalChatResult>, ErrorData> {
+        let verbosity = resolve_verbosity(params.verbosity, params.full_details);
         let effective_mode = params.mode.clone().unwrap_or(Mode::Expert);
         let progress_token = extract_progress_token(&ctx.meta);
         let mut forwarder = ProgressForwarder::new(progress_token, ctx.peer.clone());
@@ -243,7 +254,7 @@ impl Server {
         }
         forwarder.finalize().await;
         let mut result = collector.finish().map_err(Error::into_mcp)?;
-        if params.full_details {
+        if verbosity == Verbosity::Full {
             let (steps, agent_messages) = self
                 .hydrate_response_steps(&result)
                 .await
@@ -251,16 +262,20 @@ impl Server {
             result.steps = steps;
             result.agent_messages = agent_messages;
         }
+        apply_verbosity(&mut result, verbosity);
         Ok(Json(result))
     }
 
     #[tool(
         name = "grok_research_start",
-        description = "Start a long-running Grok research request without waiting for the \
-        full answer. Returns conversation_id and response_id immediately. \
-        Use grok_research_poll to retrieve the result when ready. Prefer \
-        this over grok_research for heavy expert queries that may exceed \
-        your client's timeout."
+        description = "Begin a long-running Grok research request without waiting for the \
+        answer. Returns conversation_id + response_id immediately; use \
+        grok_research_poll to retrieve the result. \
+        \
+        Prefer this over grok_research for any expert-mode query or when you \
+        suspect the response will take > 60s. Safe against client tool-call \
+        timeouts — the request continues on Grok's side and the result is \
+        fetchable by response_id for hours afterward."
     )]
     pub async fn grok_research_start(
         &self,
@@ -288,15 +303,20 @@ impl Server {
 
     #[tool(
         name = "grok_research_poll",
-        description = "Poll for a previously started research result. Returns the full \
-        answer when ready, or status 'in_progress' if Grok is still \
-        generating. Pass the conversation_id and response_id from \
-        grok_research_start. Set full_details=true to hydrate steps."
+        description = "Poll for a previously started research result by \
+        (conversation_id, response_id). Returns status='in_progress' if Grok is \
+        still generating, 'completed' with the full result when ready, or \
+        'not_found' for an unknown id pair. \
+        \
+        Pass verbosity=\"minimal\"/\"standard\"/\"full\" to control \
+        response size. include_thinking=true adds per-step reasoning traces \
+        separately from the verbosity=\"full\" hydrated fields."
     )]
     pub async fn grok_research_poll(
         &self,
         Parameters(params): Parameters<PollParams>,
     ) -> Result<Json<PollOutput>, ErrorData> {
+        let verbosity = resolve_verbosity(params.verbosity, params.full_details);
         let response_id = ResponseId::new(params.response_id);
         let loaded = self
             .client
@@ -332,11 +352,12 @@ impl Server {
         } else {
             None
         };
-        if params.full_details {
+        if verbosity == Verbosity::Full {
             let agent_messages = extract_agent_messages(&loaded_response.steps);
             result.agent_messages = agent_messages;
             result.steps = Some(loaded_response.steps.clone());
         }
+        apply_verbosity(&mut result, verbosity);
 
         Ok(Json(PollOutput {
             status: PollStatus::Completed,
@@ -500,6 +521,26 @@ impl Server {
             .unwrap_or_default();
 
         Ok((steps, agent_messages))
+    }
+}
+
+fn apply_verbosity(result: &mut FinalChatResult, verbosity: Verbosity) {
+    match verbosity {
+        Verbosity::Minimal => {
+            result.thinking = None;
+            result.tool_usage_cards.clear();
+            result.web_search_results.clear();
+            result.follow_up_suggestions.clear();
+            result.title = None;
+            result.unknown_events.clear();
+            result.steps = None;
+            result.agent_messages.clear();
+        }
+        Verbosity::Standard => {
+            result.steps = None;
+            result.agent_messages.clear();
+        }
+        Verbosity::Full => (),
     }
 }
 
@@ -708,15 +749,179 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        GetConversationOutput, PollOutput, build_result_from_loaded_response,
+        GetConversationOutput, PollOutput, apply_verbosity, build_result_from_loaded_response,
         extract_agent_messages, extract_step_thinking, response_is_ready,
     };
     use crate::{
         models::{
-            ConversationId, FinalChatResult, LoadedResponse, ResponseStep, RolloutId, ToolUsageCard,
+            AgentMessage, Citation, ConversationId, FinalChatResult, FollowUpSuggestion,
+            LoadedResponse, ResponseStep, RolloutId, ToolUsageCard, ToolUsageCardId,
+            WebSearchResult,
         },
-        server::output::{PollStatus, StepThinking},
+        server::{
+            output::{PollStatus, StepThinking},
+            params::{Verbosity, resolve_verbosity},
+        },
     };
+
+    fn populated_result() -> FinalChatResult {
+        FinalChatResult {
+            conversation_id: ConversationId::new("c1"),
+            response_id: crate::models::ResponseId::new("r1"),
+            parent_response_id: Some(crate::models::ResponseId::new("p1")),
+            message: "done".to_owned(),
+            thinking: Some("reasoning".to_owned()),
+            citations: vec![Citation {
+                card_id: "card-1".to_owned(),
+                citation_id: Some("7".to_owned()),
+                card_type: Some("citation_card".to_owned()),
+                url: Some("https://example.com".to_owned()),
+            }],
+            tool_usage_cards: vec![ToolUsageCard {
+                tool_usage_card_id: ToolUsageCardId::new("tool-card-1"),
+                extra: serde_json::from_value(json!({ "kind": "web_search" }))
+                    .expect("tool usage card extra"),
+            }],
+            web_search_results: vec![WebSearchResult {
+                url: "https://example.com".to_owned(),
+                title: "Example".to_owned(),
+                preview: "preview".to_owned(),
+                extra: serde_json::Map::new(),
+            }],
+            follow_up_suggestions: vec![FollowUpSuggestion {
+                label: "next".to_owned(),
+                properties: serde_json::Map::new(),
+                tool_overrides: None,
+                extra: serde_json::Map::new(),
+            }],
+            title: Some("title".to_owned()),
+            steps: Some(vec![ResponseStep {
+                text: vec!["step text".to_owned()],
+                tags: vec!["analysis".to_owned()],
+                rollout_id: Some(RolloutId::new("Agent 1")),
+                message_step_id: Some(1),
+                web_search_results: Vec::new(),
+                tool_usage_cards: Vec::new(),
+                tool_usage_results: Vec::new(),
+                extra: serde_json::Map::new(),
+            }]),
+            agent_messages: vec![AgentMessage {
+                from: RolloutId::new("Agent 1"),
+                to: "Grok".to_owned(),
+                text: "done".to_owned(),
+            }],
+            unknown_events: vec![
+                serde_json::from_value(json!({ "frame": "unknown" })).expect("unknown event"),
+            ],
+        }
+    }
+
+    #[test]
+    fn apply_verbosity_minimal_strips_everything_but_core() {
+        let mut result = populated_result();
+
+        apply_verbosity(&mut result, Verbosity::Minimal);
+
+        assert_eq!(result.conversation_id.as_str(), "c1");
+        assert_eq!(result.response_id.as_str(), "r1");
+        assert_eq!(
+            result.parent_response_id.as_ref().map(|id| id.as_str()),
+            Some("p1")
+        );
+        assert_eq!(result.message, "done");
+        assert_eq!(result.citations.len(), 1);
+        assert_eq!(result.thinking, None);
+        assert!(result.tool_usage_cards.is_empty());
+        assert!(result.web_search_results.is_empty());
+        assert!(result.follow_up_suggestions.is_empty());
+        assert_eq!(result.title, None);
+        assert!(result.steps.is_none());
+        assert!(result.agent_messages.is_empty());
+        assert!(result.unknown_events.is_empty());
+    }
+
+    #[test]
+    fn apply_verbosity_standard_preserves_streamed_fields_drops_hydrated() {
+        let mut result = populated_result();
+
+        apply_verbosity(&mut result, Verbosity::Standard);
+
+        assert_eq!(result.thinking.as_deref(), Some("reasoning"));
+        assert_eq!(result.tool_usage_cards.len(), 1);
+        assert_eq!(result.web_search_results.len(), 1);
+        assert_eq!(result.follow_up_suggestions.len(), 1);
+        assert_eq!(result.title.as_deref(), Some("title"));
+        assert!(result.steps.is_none());
+        assert!(result.agent_messages.is_empty());
+        assert_eq!(result.unknown_events.len(), 1);
+    }
+
+    #[test]
+    fn apply_verbosity_full_is_identity() {
+        let original = populated_result();
+        let mut result = original.clone();
+
+        apply_verbosity(&mut result, Verbosity::Full);
+
+        assert_eq!(
+            serde_json::to_value(&result).expect("serialize full result"),
+            serde_json::to_value(&original).expect("serialize original result")
+        );
+    }
+
+    #[test]
+    fn resolve_verbosity_prefers_explicit_over_full_details() {
+        assert_eq!(resolve_verbosity(None, false), Verbosity::Standard);
+        assert_eq!(resolve_verbosity(None, true), Verbosity::Full);
+        assert_eq!(
+            resolve_verbosity(Some(Verbosity::Minimal), true),
+            Verbosity::Minimal
+        );
+    }
+
+    #[test]
+    fn full_details_alias_keeps_hydrated_poll_fields_when_verbosity_is_unset() {
+        let loaded = LoadedResponse {
+            response_id: crate::models::ResponseId::new("r1"),
+            steps: vec![ResponseStep {
+                text: vec!["done".to_owned()],
+                tags: vec!["final".to_owned()],
+                rollout_id: Some(RolloutId::new("Agent 1")),
+                message_step_id: Some(1),
+                web_search_results: Vec::new(),
+                tool_usage_cards: vec![
+                    serde_json::from_value::<ToolUsageCard>(json!({
+                        "toolUsageCardId": "tool-card-1",
+                        "chatroomSend": {
+                            "args": {
+                                "to": "Grok",
+                                "message": "done"
+                            }
+                        }
+                    }))
+                    .expect("tool card"),
+                ],
+                tool_usage_results: Vec::new(),
+                extra: serde_json::Map::new(),
+            }],
+            extra: serde_json::from_value(json!({ "message": "done", "partial": false }))
+                .expect("extra map"),
+        };
+        let mut result = build_result_from_loaded_response(ConversationId::new("c1"), &loaded)
+            .expect("result from loaded response");
+        let verbosity = resolve_verbosity(None, true);
+
+        if verbosity == Verbosity::Full {
+            result.agent_messages = extract_agent_messages(&loaded.steps);
+            result.steps = Some(loaded.steps.clone());
+        }
+        apply_verbosity(&mut result, verbosity);
+
+        assert_eq!(result.message, "done");
+        assert_eq!(result.steps.as_ref().map(Vec::len), Some(1));
+        assert_eq!(result.agent_messages.len(), 1);
+        assert_eq!(result.agent_messages[0].from.as_str(), "Agent 1");
+    }
 
     #[test]
     fn extract_agent_messages_reads_chatroom_send_cards() {

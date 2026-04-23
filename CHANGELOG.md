@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ChatOptions` and `IntegrationFlags` in `models::options` — user-facing
   per-call chat overrides, exported from the crate root.
 - `PollStatus` enum replacing the stringly-typed `PollOutput.status` field.
+- `verbosity` on `grok_research` and `grok_research_poll` with `minimal`,
+  `standard`, and `full` tiers so callers can keep large expert-mode payloads
+  out of their context window unless they explicitly need hydrated step data.
 
 ### Changed
 - BREAKING (library API, not wire): `Conversations::start(message)` now takes
@@ -24,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and integration-flag fields.
 - `PollOutput.status` now uses the `PollStatus` enum while preserving the JSON
   wire values (`"in_progress"`, `"completed"`, `"not_found"`).
+- Tool descriptions for `grok_research`, `grok_research_start`, and
+  `grok_research_poll` now steer expert-mode callers toward the timeout-safe
+  start/poll flow and document the new verbosity tiers.
+
+### Deprecated
+- `full_details` on `grok_research` and `grok_research_poll`; use
+  `verbosity = "full"` instead. The boolean remains as a compatibility alias.
 
 ### Removed
 - `apply_research_options!` and the private conversation-builder override

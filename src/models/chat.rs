@@ -196,8 +196,8 @@ pub enum StreamEvent {
 
 /// Drained result of a streaming chat request, suitable for a single tool reply.
 ///
-/// `steps` is populated only when `grok_research` was invoked with
-/// `full_details = true`.
+/// `steps` is populated only when the caller asks for hydrated output via
+/// `verbosity = "full"` (or the deprecated `full_details = true` alias).
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct FinalChatResult {
     pub conversation_id: ConversationId,
@@ -217,8 +217,8 @@ pub struct FinalChatResult {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steps: Option<Vec<ResponseStep>>,
-    /// Multi-agent chatroom messages extracted from hydrated `steps` when
-    /// `full_details = true`.
+    /// Multi-agent chatroom messages extracted from hydrated `steps` when the
+    /// caller requests `verbosity = "full"`.
     pub agent_messages: Vec<AgentMessage>,
     /// Unclassified stream frames (objects only); empty in the happy path.
     ///

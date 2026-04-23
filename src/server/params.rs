@@ -6,6 +6,43 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::common::{ConversationId, FileMetadataId, Mode, ResponseId};
 
+/// How much of a research result to return.
+///
+/// Larger tiers include every field from the smaller ones plus extra detail.
+/// Callers should pick the smallest tier that answers their question so expert
+/// runs do not waste context window on fields they will ignore.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Verbosity {
+    /// Return only the core answer payload and source citations.
+    ///
+    /// This is the best fit for agents that only need the final answer and want
+    /// to keep large expert-mode payloads out of their parent context.
+    Minimal,
+    /// Preserve today's streamed-result shape without hydration.
+    ///
+    /// This stays the default so existing callers keep the same payload size and
+    /// field set unless they opt into a different tier explicitly.
+    #[default]
+    Standard,
+    /// Include hydrated per-step output as well.
+    ///
+    /// This costs an extra HTTP round-trip to Grok, so callers should request it
+    /// only when they need step-level reasoning or agent-message extraction.
+    Full,
+}
+
+/// Resolve the requested output tier while keeping `full_details` as a
+/// compatibility alias for callers that still depend on the old boolean API.
+#[must_use]
+pub(crate) fn resolve_verbosity(verbosity: Option<Verbosity>, full_details: bool) -> Verbosity {
+    match verbosity {
+        Some(verbosity) => verbosity,
+        None if full_details => Verbosity::Full,
+        None => Verbosity::Standard,
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct RateLimitsParams {
     /// Mode to query rate limits for. Defaults to the configured runtime mode.
@@ -55,10 +92,15 @@ pub struct AskParams {
     /// `fileAttachments` on the outgoing chat request.
     #[serde(default)]
     pub attachments: Vec<FileMetadataId>,
-    /// When true, hydrate the response with `steps[]` (per-step tags,
-    /// rolloutId, toolUsageCards, toolUsageResults, webSearchResults) by
-    /// calling response-node + load-responses after the stream ends.
-    /// Adds one extra HTTP round-trip.
+    /// Controls how much result detail comes back so callers can trade payload
+    /// size against post-hydrated reasoning data. Defaults to `standard`.
+    #[serde(default)]
+    pub verbosity: Option<Verbosity>,
+    /// Deprecated compatibility alias for `verbosity = "full"`.
+    ///
+    /// Keep using this only if you must preserve an older caller shape. When
+    /// `verbosity` is also set, the explicit tier wins so there is only one
+    /// source of truth for output shaping.
     #[serde(default)]
     pub full_details: bool,
 }
@@ -67,8 +109,14 @@ pub struct AskParams {
 pub struct PollParams {
     pub conversation_id: String,
     pub response_id: String,
-    /// When true and the response is ready, hydrate `steps[]` and
-    /// `agent_messages[]` the same way as `grok_research(full_details=true)`.
+    /// Controls how much result detail comes back so poll responses can stay
+    /// compact unless the caller truly needs hydrated step data.
+    #[serde(default)]
+    pub verbosity: Option<Verbosity>,
+    /// Deprecated compatibility alias for `verbosity = "full"`.
+    ///
+    /// The alias stays for back-compat with older clients; an explicit
+    /// `verbosity` value wins so mixed callers stay deterministic.
     #[serde(default)]
     pub full_details: bool,
     /// Include per-step thinking traces (agent reasoning, tool calls). Off by
