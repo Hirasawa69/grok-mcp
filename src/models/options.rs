@@ -180,8 +180,14 @@ mod tests {
         assert_eq!(value.get("modeId"), Some(&json!("expert")));
         assert_eq!(value.get("fileAttachments"), Some(&json!(["file-1"])));
         assert_eq!(value.get("disableSearch"), Some(&json!(true)));
+        assert_eq!(value.get("enableImageGeneration"), Some(&json!(true)));
+        assert_eq!(value.get("imageGenerationCount"), Some(&json!(2)));
         assert_eq!(value.get("forceConcise"), Some(&json!(true)));
+        assert_eq!(value.get("enableSideBySide"), Some(&json!(true)));
         assert_eq!(value.get("disableMemory"), Some(&json!(true)));
+        assert_eq!(value.get("disabledConnectorIds"), Some(&json!([])));
+        assert_eq!(value.get("linkQuery"), Some(&json!(false)));
+        assert!(value.get("connectors").is_none());
         assert_eq!(
             value
                 .get("toolOverrides")
@@ -219,5 +225,30 @@ mod tests {
             Some(&json!(false))
         );
         assert_eq!(value.get("disableSearch"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn empty_integration_flags_omit_tool_overrides_and_connectors() {
+        let defaults = ChatDefaults::default();
+        let request =
+            ChatOptions::default().into_new_conversation_request("hello".to_owned(), &defaults);
+
+        let value = serde_json::to_value(&request).expect("serialize new conversation request");
+
+        assert!(value.get("toolOverrides").is_none());
+        assert!(value.get("connectors").is_none());
+        assert_eq!(value.get("disabledConnectorIds"), Some(&json!([])));
+        assert_eq!(value.get("linkQuery"), Some(&json!(false)));
+        assert_eq!(
+            value.get("deviceEnvInfo"),
+            Some(&json!({
+                "darkModeEnabled": false,
+                "devicePixelRatio": 1,
+                "screenWidth": 1366,
+                "screenHeight": 768,
+                "viewportWidth": 1366,
+                "viewportHeight": 682
+            }))
+        );
     }
 }

@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `client::statsig::ChallengeConfig` — cryptographic generator for the grok.com
+  `x-statsig-id` anti-bot token. The token is `header[49] | counter_le32 |
+  sha256("METHOD!path!counter" + suffix)[..16] | trailer`, XOR-masked with a
+  random byte and base64-encoded. Built-in defaults track the current grok.com
+  build; override the three constants via the `[challenge]` config table when
+  grok.com rotates them.
+- `GrokClient::with_challenge` to build a client with explicit anti-bot
+  challenge constants.
+- `[challenge]` config table (`header_hex`, `suffix`, `trailer`) for refreshing
+  the anti-bot constants without a rebuild.
 - `ChatOptions` and `IntegrationFlags` in `models::options` — user-facing
   per-call chat overrides, exported from the crate root.
 - `PollStatus` enum replacing the stringly-typed `PollOutput.status` field.
@@ -16,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   out of their context window unless they explicitly need hydrated step data.
 
 ### Changed
+- Bumped `reqwest` to 0.13.4 and added `brotli`/`deflate`/`zstd` decoding to
+  match the grok.com web client's `Accept-Encoding`. grok.com's `/rest/*`
+  surface does not enforce a Chrome TLS fingerprint once `x-statsig-id` is
+  correctly signed, so a plain rustls client is sufficient.
 - BREAKING (library API, not wire): `Conversations::start(message)` now takes
   the initial message as a positional argument, so new-conversation requests
   require it at compile time.
@@ -40,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   helpers, now replaced by `ChatOptions` conversions.
 
 ### Fixed
+- `grok_research` (and every other tool) no longer fails with `code: 7
+  "Request rejected by anti-bot rules."` on the chat/streaming endpoints. The
+  `x-statsig-id` header is now a valid signed token instead of random bytes,
+  which grok.com's anti-bot layer rejects on `POST /rest/app-chat/*`.
 - `grok_research_poll` no longer reports `status: "completed"` with an empty
   `message` while Grok is still generating. Readiness now requires actual
   content (non-empty `message` or at least one step) in the loaded response:

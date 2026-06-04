@@ -1,14 +1,13 @@
-//! `{code, message, details}` envelope used by grok.com on non-2xx responses.
+//! `{code, message, details}` error payload used by grok.com on non-2xx responses.
 
 use std::fmt;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// grok.com application-error envelope.
+/// grok.com application-error payload.
 ///
-/// Every observed non-2xx response from the `/rest/*` surface has carried
-/// exactly this shape. Generalising to every endpoint is a working assumption.
+/// Some endpoints return this directly; others wrap it under an `error` field.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GrokApiError {
     pub code: i64,
@@ -24,6 +23,17 @@ impl fmt::Display for GrokApiError {
 }
 
 impl GrokApiError {
+    /// Heuristic check for Grok's anti-bot rejection envelope.
+    ///
+    /// The currently observed chat-stream block is HTTP `403` with code `7`
+    /// and message `Request rejected by anti-bot rules.`. Keep the message
+    /// check loose because this API is undocumented and may change wording.
+    #[must_use]
+    pub fn looks_like_anti_bot(&self) -> bool {
+        let lower = self.message.to_lowercase();
+        self.code == 7 && (lower.contains("anti-bot") || lower.contains("bot"))
+    }
+
     /// Heuristic check for auth-expiry shape.
     ///
     /// grok.com does not document a stable error code for expired sessions. The

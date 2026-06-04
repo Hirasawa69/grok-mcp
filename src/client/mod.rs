@@ -8,16 +8,20 @@
 
 pub mod conversations;
 pub mod headers;
+pub mod statsig;
 pub mod stream;
 pub mod uploads;
 
 use std::{sync::Arc, time::Duration};
 
-use reqwest::{Response, StatusCode};
-use serde::{Serialize, de::DeserializeOwned};
+use reqwest::{Response, StatusCode, cookie::Jar};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
+use tokio::sync::OnceCell;
+use url::Url;
 
 use crate::{
+    client::statsig::ChallengeConfig,
     config::{NetworkConfig, RuntimeState},
     cookie::GrokCookie,
     error::{Error, Result},
@@ -28,13 +32,14 @@ use crate::{
 
 /// Thin wrapper around [`reqwest::Client`] with grok.com-specific wiring.
 ///
-/// Clone is cheap — the inner `reqwest::Client` and `GrokCookie` share state via
-/// `Arc`, and [`RuntimeState`] already wraps its own `Arc`.
+/// Clone is cheap — the inner `reqwest::Client`, session warmup state, and
+/// [`RuntimeState`] all share `Arc`-backed state.
 #[derive(Clone)]
 pub struct GrokClient {
     http: reqwest::Client,
     network: Arc<NetworkConfig>,
-    cookie: GrokCookie,
+    challenge: Arc<ChallengeConfig>,
+    session_ready: Arc<OnceCell<()>>,
     runtime: RuntimeState,
 }
 
@@ -44,17 +49,45 @@ impl GrokClient {
     /// # Errors
     ///
     /// Returns [`crate::error::Error::Transport`] if the underlying
-    /// `reqwest::Client` fails to build (TLS init, etc.).
+    /// HTTP client fails to build.
     pub fn new(cookie: GrokCookie, network: NetworkConfig, runtime: RuntimeState) -> Result<Self> {
+        Self::with_challenge(cookie, network, ChallengeConfig::default(), runtime)
+    }
+
+    /// Build a new client with an explicit anti-bot [`ChallengeConfig`].
+    ///
+    /// Use this to override the built-in challenge constants when grok.com
+    /// rotates its build. [`Self::new`] uses [`ChallengeConfig::default`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::Transport`] if the underlying HTTP client
+    /// fails to build, or [`crate::error::Error::StreamDecode`] if `base_url`
+    /// is not a valid URL.
+    pub fn with_challenge(
+        cookie: GrokCookie,
+        network: NetworkConfig,
+        challenge: ChallengeConfig,
+        runtime: RuntimeState,
+    ) -> Result<Self> {
+        let base_url = Url::parse(&network.base_url)
+            .map_err(|error| Error::StreamDecode(format!("invalid base_url: {error}")))?;
+        let cookie_jar = Arc::new(Jar::default());
+        seed_cookie_jar(&cookie_jar, &cookie, &base_url);
+
         let http = reqwest::Client::builder()
             .timeout(network.timeout)
             .gzip(true)
-            .cookie_store(true)
+            .brotli(true)
+            .zstd(true)
+            .deflate(true)
+            .cookie_provider(cookie_jar)
             .build()?;
         Ok(Self {
             http,
             network: Arc::new(network),
-            cookie,
+            challenge: Arc::new(challenge),
+            session_ready: Arc::new(OnceCell::new()),
             runtime,
         })
     }
@@ -69,16 +102,16 @@ impl GrokClient {
         &self.http
     }
 
-    pub(crate) fn cookie(&self) -> &GrokCookie {
-        &self.cookie
-    }
-
     pub(crate) fn base_url(&self) -> &str {
         &self.network.base_url
     }
 
     pub(crate) fn user_agent(&self) -> &str {
         &self.network.user_agent
+    }
+
+    pub(crate) fn challenge(&self) -> &ChallengeConfig {
+        &self.challenge
     }
 
     pub(crate) fn stream_idle_timeout(&self) -> Duration {
@@ -115,8 +148,10 @@ impl GrokClient {
     where
         T: DeserializeOwned,
     {
+        self.ensure_browser_session().await?;
         let url = format!("{}{}", self.base_url(), path);
-        let (headers, request_id) = headers::build_default_headers(self, ACCEPT_JSON)?;
+        let (headers, request_id) =
+            headers::build_default_headers(self, ACCEPT_JSON, headers::FetchMethod::Get, path)?;
         tracing::debug!(endpoint = %path, %request_id, "GET");
         let response = self.http().get(url).headers(headers).send().await?;
         let body = ensure_success(response, path).await?;
@@ -128,8 +163,10 @@ impl GrokClient {
         B: Serialize + ?Sized,
         T: DeserializeOwned,
     {
+        self.ensure_browser_session().await?;
         let url = format!("{}{}", self.base_url(), path);
-        let (headers, request_id) = headers::build_default_headers(self, ACCEPT_JSON)?;
+        let (headers, request_id) =
+            headers::build_default_headers(self, ACCEPT_JSON, headers::FetchMethod::Post, path)?;
         tracing::debug!(endpoint = %path, %request_id, "POST");
         let response = self
             .http()
@@ -146,8 +183,10 @@ impl GrokClient {
     where
         B: Serialize + ?Sized,
     {
+        self.ensure_browser_session().await?;
         let url = format!("{}{}", self.base_url(), path);
-        let (headers, request_id) = headers::build_default_headers(self, ACCEPT_STREAM)?;
+        let (headers, request_id) =
+            headers::build_default_headers(self, ACCEPT_STREAM, headers::FetchMethod::Post, path)?;
         tracing::debug!(endpoint = %path, %request_id, "POST stream");
         let response = self
             .http()
@@ -162,10 +201,40 @@ impl GrokClient {
             self.stream_idle_timeout(),
         ))
     }
+
+    async fn ensure_browser_session(&self) -> Result<()> {
+        self.session_ready
+            .get_or_try_init(|| async { self.warm_browser_session().await })
+            .await
+            .map(|_| ())
+    }
+
+    async fn warm_browser_session(&self) -> Result<()> {
+        let url = format!("{}/", self.base_url().trim_end_matches('/'));
+        let headers = headers::build_warmup_headers(self)?;
+        let response = self.http().get(url).headers(headers).send().await?;
+        let status = response.status();
+        let body = response.bytes().await.map_err(Error::Transport)?;
+        if status.is_success() {
+            return Ok(());
+        }
+        Err(classify_error(status, &body, "/"))
+    }
 }
 
-const ACCEPT_JSON: &str = "application/json, text/plain, */*";
+const ACCEPT_JSON: &str = "*/*";
 const ACCEPT_STREAM: &str = "*/*";
+
+fn seed_cookie_jar(jar: &Jar, cookie: &GrokCookie, base_url: &Url) {
+    for pair in cookie
+        .expose()
+        .split(';')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+    {
+        jar.add_cookie_str(pair, base_url);
+    }
+}
 
 async fn ensure_success(response: Response, path: &str) -> Result<Vec<u8>> {
     let status = response.status();
@@ -186,7 +255,7 @@ async fn ensure_stream_success(response: Response, path: &str) -> Result<Respons
 }
 
 fn classify_error(status: StatusCode, body: &[u8], path: &str) -> Error {
-    let parsed = serde_json::from_slice::<GrokApiError>(body).ok();
+    let parsed = parse_api_error(body);
     let preview = preview_body(body);
 
     match (status, parsed) {
@@ -194,6 +263,8 @@ fn classify_error(status: StatusCode, body: &[u8], path: &str) -> Error {
         (StatusCode::FORBIDDEN, Some(api_error)) => {
             if api_error.looks_like_auth_failure() {
                 Error::AuthExpired
+            } else if api_error.looks_like_anti_bot() {
+                Error::AntiBot(api_error)
             } else {
                 Error::Forbidden(api_error)
             }
@@ -213,6 +284,16 @@ fn classify_error(status: StatusCode, body: &[u8], path: &str) -> Error {
     }
 }
 
+fn parse_api_error(body: &[u8]) -> Option<GrokApiError> {
+    serde_json::from_slice::<GrokApiError>(body)
+        .ok()
+        .or_else(|| {
+            serde_json::from_slice::<GrokApiErrorEnvelope>(body)
+                .ok()
+                .map(|envelope| envelope.error)
+        })
+}
+
 fn preview_body(bytes: &[u8]) -> String {
     const MAX: usize = 2048;
     let slice = if bytes.len() > MAX {
@@ -221,4 +302,9 @@ fn preview_body(bytes: &[u8]) -> String {
         bytes
     };
     String::from_utf8_lossy(slice).into_owned()
+}
+
+#[derive(Debug, Deserialize)]
+struct GrokApiErrorEnvelope {
+    error: GrokApiError,
 }

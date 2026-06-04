@@ -73,7 +73,7 @@ disable_text_follow_ups = false
 
 [network]
 base_url = "https://grok.com"
-user_agent = "<auto>"        # use the Chromium-like default
+user_agent = "<auto>"        # use the Chrome-like default
 timeout_seconds = 120
 stream_idle_timeout_seconds = 60
 ```

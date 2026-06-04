@@ -20,6 +20,17 @@ pub struct AuthStatus {
     pub tier: Option<Tier>,
     pub status: Option<SubscriptionStatus>,
     pub active_until: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subscriptions: Vec<AuthSubscription>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuthSubscription {
+    pub user_id: UserId,
+    pub tier: Tier,
+    pub status: SubscriptionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_until: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

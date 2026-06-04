@@ -48,7 +48,10 @@ pub struct ChatRequestOptions {
     pub image_generation_count: u32,
     #[serde(rename = "forceConcise")]
     pub force_concise: bool,
-    #[serde(rename = "toolOverrides")]
+    #[serde(
+        rename = "toolOverrides",
+        skip_serializing_if = "ToolOverrides::is_empty"
+    )]
     pub tool_overrides: ToolOverrides,
     #[serde(rename = "enableSideBySide")]
     pub enable_side_by_side: bool,
@@ -68,24 +71,28 @@ pub struct ChatRequestOptions {
     pub disable_self_harm_short_circuit: bool,
     #[serde(rename = "collectionIds")]
     pub collection_ids: Vec<String>,
-    #[serde(rename = "connectors")]
+    #[serde(rename = "disabledConnectorIds")]
+    pub disabled_connector_ids: Vec<String>,
+    #[serde(rename = "connectors", skip_serializing_if = "Vec::is_empty")]
     pub connectors: Vec<serde_json::Value>,
     #[serde(rename = "deviceEnvInfo")]
     pub device_env_info: DeviceEnvInfo,
+    #[serde(rename = "linkQuery")]
+    pub link_query: bool,
 }
 
 impl Default for ChatRequestOptions {
     fn default() -> Self {
         Self {
             disable_search: false,
-            enable_image_generation: false,
+            enable_image_generation: true,
             return_image_bytes: false,
             return_raw_grok_in_xai_request: false,
             enable_image_streaming: true,
-            image_generation_count: 0,
+            image_generation_count: 2,
             force_concise: false,
             tool_overrides: ToolOverrides::default(),
-            enable_side_by_side: false,
+            enable_side_by_side: true,
             send_final_metadata: true,
             disable_text_follow_ups: false,
             response_metadata: serde_json::Map::new(),
@@ -94,8 +101,10 @@ impl Default for ChatRequestOptions {
             is_async_chat: false,
             disable_self_harm_short_circuit: false,
             collection_ids: Vec::new(),
+            disabled_connector_ids: Vec::new(),
             connectors: Vec::new(),
             device_env_info: DeviceEnvInfo::default(),
+            link_query: false,
         }
     }
 }
@@ -109,10 +118,10 @@ pub struct NewConversationRequest {
     pub file_attachments: Vec<FileMetadataId>,
     #[serde(rename = "imageAttachments")]
     pub image_attachments: Vec<FileMetadataId>,
-    #[serde(rename = "modeId")]
-    pub mode_id: Mode,
     #[serde(flatten)]
     pub options: ChatRequestOptions,
+    #[serde(rename = "modeId")]
+    pub mode_id: Mode,
 }
 
 /// Body for `POST /rest/app-chat/conversations/<id>/responses`.
@@ -125,12 +134,12 @@ pub struct ContinueConversationRequest {
     pub file_attachments: Vec<FileMetadataId>,
     #[serde(rename = "imageAttachments")]
     pub image_attachments: Vec<FileMetadataId>,
+    #[serde(flatten)]
+    pub options: ChatRequestOptions,
     /// `modeId` is optional on continuations — if omitted, grok.com reuses the
     /// conversation's current mode.
     #[serde(rename = "modeId", skip_serializing_if = "Option::is_none")]
     pub mode_id: Option<Mode>,
-    #[serde(flatten)]
-    pub options: ChatRequestOptions,
 }
 
 /// Normalized semantic event from the NDJSON stream.

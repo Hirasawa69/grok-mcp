@@ -16,13 +16,14 @@ directories = "6.0.0"
 futures-util = "0.3.32"
 rand = "0.10.1"
 regex = "1.12.3"
-reqwest = { version = "0.13.2", default-features = false, features = ["cookies", "gzip", "json", "rustls", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["brotli", "cookies", "deflate", "gzip", "json", "rustls", "stream", "zstd"] }
 rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", rev = "020a38b6ad3d0f26487c464250a484fad2a06b0e", default-features = false, features = ["macros", "server", "transport-io"] }
 schemars = { version = "1.2.1", features = ["chrono04"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["raw_value"] }
 serde_with = "3.18.0"
+sha2 = "0.11.0"
 thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["formatting", "macros", "parsing", "serde"] }
 tokio = { version = "1.52.1", features = ["fs", "io-std", "macros", "rt-multi-thread", "signal", "sync"] }

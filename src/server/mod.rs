@@ -39,8 +39,9 @@ use crate::{
     },
     server::{
         output::{
-            AuthStatus, DefaultsOutput, GetConversationOutput, ListConversationsOutput, PollOutput,
-            PollStatus, RateLimitsOutput, ResearchStartOutput, StepThinking, UploadFileOutput,
+            AuthStatus, AuthSubscription, DefaultsOutput, GetConversationOutput,
+            ListConversationsOutput, PollOutput, PollStatus, RateLimitsOutput, ResearchStartOutput,
+            StepThinking, UploadFileOutput,
         },
         params::{
             AskParams, GetConversationParams, ListConversationsParams, PollParams,
@@ -94,16 +95,22 @@ impl Server {
     )]
     pub async fn grok_check_auth(&self) -> Result<Json<AuthStatus>, ErrorData> {
         let subscriptions = self.client.subscriptions().await.map_err(Error::into_mcp)?;
-        let (user_id, tier, status, active_until) = match subscriptions.subscriptions.first() {
+        let summaries = subscriptions
+            .subscriptions
+            .iter()
+            .map(|s| AuthSubscription {
+                user_id: s.xai_user_id.clone(),
+                tier: s.tier.clone(),
+                status: s.status.clone(),
+                active_until: s.active_until().map(str::to_owned),
+            })
+            .collect::<Vec<AuthSubscription>>();
+        let (user_id, tier, status, active_until) = match subscriptions.primary() {
             Some(sub) => (
                 Some(sub.xai_user_id.clone()),
                 Some(sub.tier.clone()),
                 Some(sub.status.clone()),
-                sub.stripe
-                    .as_ref()
-                    .and_then(|value| value.get("currentPeriodEnd"))
-                    .and_then(|value| value.as_str())
-                    .map(str::to_owned),
+                sub.active_until().map(str::to_owned),
             ),
             None => (
                 None::<UserId>,
@@ -118,6 +125,7 @@ impl Server {
             tier,
             status,
             active_until,
+            subscriptions: summaries,
         }))
     }
 
@@ -231,7 +239,7 @@ impl Server {
         let mut forwarder = ProgressForwarder::new(progress_token, ctx.peer.clone());
 
         let (mut stream, seed_conv_id) = self
-            .open_research_stream(&params, effective_mode)
+            .open_research_stream(&params, effective_mode.clone())
             .await
             .map_err(Error::into_mcp)?;
 
@@ -285,7 +293,7 @@ impl Server {
 
         let seed_conversation_id = params.conversation_id.clone();
         let (mut stream, _) = self
-            .open_research_stream(&params, effective_mode)
+            .open_research_stream(&params, effective_mode.clone())
             .await
             .map_err(Error::into_mcp)?;
 
@@ -570,7 +578,7 @@ fn build_result_from_loaded_response(
         .cloned()
         .map(serde_json::from_value::<Vec<FollowUpSuggestion>>)
         .transpose()
-        .map_err(crate::error::Error::Serde)?
+        .map_err(Error::Serde)?
         .unwrap_or_default();
     let web_search_results = match loaded.extra.get("webSearchResults") {
         Some(value) => extract_web_search_results(value.clone())?,

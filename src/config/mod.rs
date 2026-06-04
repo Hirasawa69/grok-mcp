@@ -20,6 +20,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    client::statsig::ChallengeConfig,
     cookie::GrokCookie,
     error::{ConfigError, Error, Result},
     models::common::Mode,
@@ -28,8 +29,8 @@ use crate::{
 pub use defaults::ChatDefaults;
 pub use runtime::RuntimeState;
 
-#[rustfmt::skip]
-pub(crate) const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36";
+pub(crate) const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+     Chrome/147.0.0.0 Safari/537.36";
 
 /// Fully resolved configuration, ready to build a client and server from.
 #[derive(Debug)]
@@ -37,6 +38,7 @@ pub struct Config {
     pub cookie: GrokCookie,
     pub defaults: ChatDefaults,
     pub network: NetworkConfig,
+    pub challenge: ChallengeConfig,
 }
 
 /// Network / transport tuning. Defaults mirror the grok.com web client.
@@ -101,11 +103,31 @@ impl Config {
             network.timeout = timeout;
         }
 
+        let challenge = resolve_challenge(file_config.challenge)?;
+
         Ok(Self {
             cookie,
             defaults,
             network,
+            challenge,
         })
+    }
+}
+
+/// Resolve the anti-bot challenge config, falling back to the built-in defaults
+/// for any field the user did not override.
+fn resolve_challenge(file: Option<ChallengeFileConfig>) -> Result<ChallengeConfig> {
+    let Some(file) = file else {
+        return Ok(ChallengeConfig::default());
+    };
+    match (file.header_hex, file.suffix, file.trailer) {
+        (None, None, None) => Ok(ChallengeConfig::default()),
+        (Some(header_hex), Some(suffix), Some(trailer)) => {
+            ChallengeConfig::new(&header_hex, suffix, trailer)
+        }
+        _ => Err(Error::Config(ConfigError::MissingRequired(
+            "challenge requires all of header_hex, suffix, trailer (or none)",
+        ))),
     }
 }
 
@@ -117,6 +139,8 @@ struct FileConfig {
     defaults: Option<ChatDefaults>,
     #[serde(default)]
     network: Option<NetworkFileConfig>,
+    #[serde(default)]
+    challenge: Option<ChallengeFileConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -131,12 +155,27 @@ struct NetworkFileConfig {
     stream_idle_timeout_seconds: Option<u64>,
 }
 
+/// Optional override of the grok.com anti-bot `x-statsig-id` challenge constants.
+///
+/// All three fields must be set together or all left unset. Refresh them via the
+/// browser-console snippet in `README.md` when grok.com ships a new build.
+#[derive(Debug, Deserialize, Serialize)]
+struct ChallengeFileConfig {
+    #[serde(default)]
+    header_hex: Option<String>,
+    #[serde(default)]
+    suffix: Option<String>,
+    #[serde(default)]
+    trailer: Option<u8>,
+}
+
 impl FileConfig {
     fn network_resolved(self) -> ResolvedFileConfig {
         ResolvedFileConfig {
             cookie: self.cookie,
             defaults: self.defaults,
             network: Some(resolve_network(self.network)),
+            challenge: self.challenge,
         }
     }
 }
@@ -149,10 +188,8 @@ fn resolve_network(network: Option<NetworkFileConfig>) -> NetworkConfig {
     if let Some(url) = file.base_url {
         base.base_url = url;
     }
-    if let Some(agent) = file.user_agent
-        && !agent.eq_ignore_ascii_case("<auto>")
-    {
-        base.user_agent = agent;
+    if let Some(value) = resolved_auto_string(file.user_agent) {
+        base.user_agent = value;
     }
     if let Some(seconds) = file.timeout_seconds {
         base.timeout = Duration::from_secs(seconds);
@@ -163,11 +200,20 @@ fn resolve_network(network: Option<NetworkFileConfig>) -> NetworkConfig {
     base
 }
 
+fn resolved_auto_string(value: Option<String>) -> Option<String> {
+    let value = value?;
+    if value.eq_ignore_ascii_case("<auto>") {
+        return None;
+    }
+    Some(value)
+}
+
 #[derive(Debug, Default)]
 struct ResolvedFileConfig {
     cookie: Option<String>,
     defaults: Option<ChatDefaults>,
     network: Option<NetworkConfig>,
+    challenge: Option<ChallengeFileConfig>,
 }
 
 fn load_file_config(override_path: Option<&Path>) -> Result<ResolvedFileConfig> {
@@ -312,5 +358,34 @@ fn parse_env_mode(raw: &str) -> Mode {
         "expert" => Mode::Expert,
         "fast" => Mode::Fast,
         _ => Mode::Other(raw.trim().to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_USER_AGENT, NetworkFileConfig, resolve_network};
+
+    #[test]
+    fn resolve_network_keeps_auto_browser_header_defaults() {
+        let network = resolve_network(Some(NetworkFileConfig {
+            base_url: None,
+            user_agent: Some("<auto>".to_owned()),
+            timeout_seconds: None,
+            stream_idle_timeout_seconds: None,
+        }));
+
+        assert_eq!(network.user_agent, DEFAULT_USER_AGENT);
+    }
+
+    #[test]
+    fn resolve_network_accepts_custom_user_agent() {
+        let network = resolve_network(Some(NetworkFileConfig {
+            base_url: None,
+            user_agent: Some("Browser/1.0".to_owned()),
+            timeout_seconds: None,
+            stream_idle_timeout_seconds: None,
+        }));
+
+        assert_eq!(network.user_agent, "Browser/1.0");
     }
 }

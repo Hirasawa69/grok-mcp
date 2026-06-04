@@ -223,10 +223,20 @@ pub struct ToolOverrides {
     pub google_drive_search: Option<bool>,
 }
 
-/// Browser fingerprint block sent on every chat request.
+impl ToolOverrides {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.gmail_search.is_none()
+            && self.google_calendar_search.is_none()
+            && self.outlook_search.is_none()
+            && self.outlook_calendar_search.is_none()
+            && self.google_drive_search.is_none()
+    }
+}
+
+/// Browser viewport metadata sent on every chat request.
 ///
-/// Defaults approximate a modern Chromium window. Override from the config file
-/// if you need to match a specific environment.
+/// Defaults approximate a desktop browser window.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct DeviceEnvInfo {
     #[serde(rename = "darkModeEnabled")]
@@ -251,12 +261,12 @@ pub struct DeviceEnvInfo {
 impl Default for DeviceEnvInfo {
     fn default() -> Self {
         Self {
-            dark_mode_enabled: true,
+            dark_mode_enabled: false,
             device_pixel_ratio: 1,
-            screen_width: 1920,
-            screen_height: 1080,
-            viewport_width: 1920,
-            viewport_height: 1000,
+            screen_width: 1366,
+            screen_height: 768,
+            viewport_width: 1366,
+            viewport_height: 682,
         }
     }
 }

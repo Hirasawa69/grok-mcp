@@ -12,6 +12,14 @@ use crate::models::api_error::GrokApiError;
 /// Result alias carrying the library [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// User-facing hints for Grok anti-bot rejection diagnostics.
+pub const ANTI_BOT_HINTS: &[&str] = &[
+    "TLS and basic cookie auth can still be valid; Grok rejected this specific chat request at the anti-bot layer.",
+    "Refresh cookies from an interactive grok.com browser session and copy the full Cookie header, including sso, sso-rw, x-userid, cf_clearance, and __cf_bm when present.",
+    "Verify the same browser can start a new Grok chat before reusing its cookies in grok-mcp.",
+    "Review grok_check_auth output if entitlement looks wrong; Grok may return historical subscriptions alongside the active one.",
+];
+
 /// Library error kinds. All fallible paths in `grok-mcp` produce one of these.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -31,6 +39,10 @@ pub enum Error {
     /// grok.com returned `403` with an upstream envelope (tier gating, etc.).
     #[error("grok forbidden: {0}")]
     Forbidden(GrokApiError),
+
+    /// grok.com rejected a request with the anti-bot envelope.
+    #[error("grok anti-bot rejected request: {0}")]
+    AntiBot(GrokApiError),
 
     /// Any other 4xx response carrying the Grok `{code, message, details}` envelope.
     #[error("grok api error: {0}")]
@@ -141,6 +153,15 @@ impl Error {
                     "grok_code": api_error.code,
                     "grok_message": api_error.message,
                     "details": api_error.details,
+                })),
+            ),
+            Self::AntiBot(api_error) => ErrorData::internal_error(
+                format!("grok anti-bot rejected request: {}", api_error.message),
+                Some(json!({
+                    "grok_code": api_error.code,
+                    "grok_message": api_error.message,
+                    "details": api_error.details,
+                    "hints": ANTI_BOT_HINTS,
                 })),
             ),
             Self::Api(api_error) => ErrorData::internal_error(

@@ -84,11 +84,12 @@ async fn run_serve(config_override: Option<&Path>) -> anyhow::Result<()> {
         cookie,
         defaults,
         network,
+        challenge,
     } = config;
 
     let runtime = RuntimeState::new(defaults);
-    let client =
-        GrokClient::new(cookie, network, runtime.clone()).context("building http client")?;
+    let client = GrokClient::with_challenge(cookie, network, challenge, runtime.clone())
+        .context("building http client")?;
     let server = Server::new(client, runtime);
 
     let cancel_token = CancellationToken::new();
@@ -146,6 +147,7 @@ fn run_print_config(config_override: Option<&Path>) -> anyhow::Result<()> {
         cookie: _,
         defaults,
         network,
+        challenge: _,
     } = config;
 
     println!("# grok-mcp effective config");
@@ -171,8 +173,8 @@ fn run_print_config(config_override: Option<&Path>) -> anyhow::Result<()> {
     );
     println!();
     println!("[network]");
-    println!("base_url = \"{url}\"", url = network.base_url);
-    println!("user_agent = \"{agent}\"", agent = network.user_agent);
+    println!("base_url = {}", toml_string(&network.base_url)?);
+    println!("user_agent = {}", toml_string(&network.user_agent)?);
     println!(
         "timeout_seconds = {seconds}",
         seconds = network.timeout.as_secs()
@@ -191,16 +193,18 @@ async fn run_check_auth(config_override: Option<&Path>) -> anyhow::Result<()> {
         cookie,
         defaults,
         network,
+        challenge,
     } = config;
     let runtime = RuntimeState::new(defaults);
-    let client = GrokClient::new(cookie, network, runtime).context("building http client")?;
+    let client = GrokClient::with_challenge(cookie, network, challenge, runtime)
+        .context("building http client")?;
 
     let subscriptions = client
         .subscriptions()
         .await
         .context("calling /rest/subscriptions")?;
 
-    let Some(sub) = subscriptions.subscriptions.first() else {
+    let Some(sub) = subscriptions.primary() else {
         bail!("authenticated, but grok.com returned no subscriptions for this account");
     };
 
@@ -208,15 +212,29 @@ async fn run_check_auth(config_override: Option<&Path>) -> anyhow::Result<()> {
     println!("user_id: {user}", user = sub.xai_user_id.as_str());
     println!("tier: {tier:?}", tier = sub.tier);
     println!("status: {status:?}", status = sub.status);
-    if let Some(stripe) = sub
-        .stripe
-        .as_ref()
-        .and_then(|value| value.get("currentPeriodEnd"))
-        .and_then(|value| value.as_str())
-    {
+    if let Some(stripe) = sub.active_until() {
         println!("active_until: {stripe}");
     }
+    if subscriptions.subscriptions.len() > 1 {
+        println!("subscriptions:");
+        for subscription in &subscriptions.subscriptions {
+            print!(
+                "  - user_id: {user}; tier: {tier:?}; status: {status:?}",
+                user = subscription.xai_user_id.as_str(),
+                tier = subscription.tier,
+                status = subscription.status,
+            );
+            if let Some(active_until) = subscription.active_until() {
+                print!("; active_until: {active_until}");
+            }
+            println!();
+        }
+    }
     Ok(())
+}
+
+fn toml_string(raw: &str) -> anyhow::Result<String> {
+    serde_json::to_string(raw).context("encoding string for TOML output")
 }
 
 fn run_list_tools(config_override: Option<&Path>) -> anyhow::Result<()> {
@@ -228,10 +246,11 @@ fn run_list_tools(config_override: Option<&Path>) -> anyhow::Result<()> {
         cookie,
         defaults,
         network,
+        challenge,
     } = config;
     let runtime = RuntimeState::new(defaults);
-    let client =
-        GrokClient::new(cookie, network, runtime.clone()).context("building http client")?;
+    let client = GrokClient::with_challenge(cookie, network, challenge, runtime.clone())
+        .context("building http client")?;
     let server = Server::new(client, runtime);
 
     for tool in server.tools() {
@@ -273,14 +292,14 @@ mode = "expert"
 disable_search = false
 force_concise = false
 disable_memory = false
-enable_image_generation = false
-image_generation_count = 0
-enable_side_by_side = false
+enable_image_generation = true
+image_generation_count = 2
+enable_side_by_side = true
 disable_text_follow_ups = false
 
 [network]
 base_url = "https://grok.com"
-# user_agent = "<auto>" (case-insensitive) keeps the built-in browser-like default.
+# "<auto>" (case-insensitive) keeps the built-in Chrome-like default.
 user_agent = "<auto>"
 timeout_seconds = 120
 stream_idle_timeout_seconds = 60

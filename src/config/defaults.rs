@@ -32,9 +32,9 @@ impl Default for ChatDefaults {
             disable_search: false,
             force_concise: false,
             disable_memory: false,
-            enable_image_generation: false,
-            image_generation_count: 0,
-            enable_side_by_side: false,
+            enable_image_generation: true,
+            image_generation_count: 2,
+            enable_side_by_side: true,
             disable_text_follow_ups: false,
         }
     }
